@@ -1,5 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
+	AssistantMessageComponent,
+	InteractiveMode,
 	createBashTool,
 	createEditTool,
 	createFindTool,
@@ -23,13 +25,34 @@ type Counters = {
 	linesRemoved: number;
 };
 
+type ToolResult = { content: Array<{ type: string; text?: string }> };
 type BuiltInTools = ReturnType<typeof createBuiltInTools>;
+type BuiltInToolName = keyof BuiltInTools;
+type ToolDefinition = {
+	label: string;
+	description: string;
+	parameters: unknown;
+};
 
 const toolCache = new Map<string, BuiltInTools>();
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-let counters: Counters = createCounters();
-let compactMode = true;
+type SharedState = {
+	counters: Counters;
+	compactMode: boolean;
+	toolsExpanded: boolean;
+	assistantMessagePatchInstalled: boolean;
+	interactiveModePatchInstalled: boolean;
+};
+
+const SHARED_STATE_KEY = Symbol.for("pi.compact-agent-flow.state");
+const shared = ((globalThis as unknown as Record<symbol, SharedState>)[SHARED_STATE_KEY] ??= {
+	counters: createCounters(),
+	compactMode: true,
+	toolsExpanded: false,
+	assistantMessagePatchInstalled: false,
+	interactiveModePatchInstalled: false,
+});
 
 function createCounters(): Counters {
 	return {
@@ -73,20 +96,102 @@ function shortenPath(path: string | undefined): string {
 function compactSummary(): string {
 	const parts = [
 		"agent working",
-		`${counters.toolsCalled} tools`,
-		`${counters.filesRead.size} files read`,
-		`${counters.filesEdited.size} files edited`,
-		`+${counters.linesAdded}/-${counters.linesRemoved}`,
+		`${shared.counters.toolsCalled} tools`,
+		`${shared.counters.filesRead.size} files read`,
+		`${shared.counters.filesEdited.size} files edited`,
+		`+${shared.counters.linesAdded}/-${shared.counters.linesRemoved}`,
 	];
-	if (counters.bashCalls > 0) parts.push(`${counters.bashCalls} shell`);
-	if (counters.searchCalls > 0) parts.push(`${counters.searchCalls} search`);
+	if (shared.counters.bashCalls > 0) parts.push(`${shared.counters.bashCalls} shell`);
+	if (shared.counters.searchCalls > 0) parts.push(`${shared.counters.searchCalls} search`);
 	return parts.join(" · ");
 }
 
 function updateWorkingUi(ctx: ExtensionContext): void {
-	const hint = keyHint("app.tools.expand", "expand");
-	ctx.ui.setWorkingMessage(`${compactSummary()} ${ctx.ui.theme.fg("dim", `(${hint})`)}`);
-	ctx.ui.setStatus("compact-agent-flow", ctx.ui.theme.fg("dim", `${compactSummary()} (${hint})`));
+	const hint = keyHint("app.tools.expand", shared.toolsExpanded ? "collapse" : "expand");
+	const summary = compactSummary();
+	ctx.ui.setWorkingMessage(`${summary} ${ctx.ui.theme.fg("dim", `(${hint})`)}`);
+	ctx.ui.setStatus("compact-agent-flow", ctx.ui.theme.fg("dim", `${summary} (${hint})`));
+}
+
+function setCompactMode(ctx: ExtensionContext, enabled: boolean): void {
+	shared.compactMode = enabled;
+	shared.toolsExpanded = !enabled;
+	ctx.ui.setToolsExpanded(shared.toolsExpanded);
+	ctx.ui.setHiddenThinkingLabel(enabled ? "" : undefined);
+}
+
+function toggleCompactMode(ctx: ExtensionContext): void {
+	setCompactMode(ctx, !shared.compactMode);
+	ctx.ui.notify(`Compact agent flow ${shared.compactMode ? "enabled" : "disabled"}`, "info");
+	updateWorkingUi(ctx);
+}
+
+function shouldHideReasoning(): boolean {
+	return shared.compactMode && !shared.toolsExpanded;
+}
+
+function compactAssistantContent(content: any): any {
+	if (content.type === "thinking") return undefined;
+	if (content.type === "text" && typeof content.text === "string") {
+		return { ...content, text: content.text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() };
+	}
+	return content;
+}
+
+function installUiPatches(): void {
+	if (!shared.interactiveModePatchInstalled) {
+		shared.interactiveModePatchInstalled = true;
+		const prototype = InteractiveMode.prototype as unknown as { setToolsExpanded?: (expanded: boolean) => void };
+		const originalSetToolsExpanded = prototype.setToolsExpanded;
+		if (typeof originalSetToolsExpanded === "function") {
+			prototype.setToolsExpanded = function patchedSetToolsExpanded(this: unknown, expanded: boolean) {
+				shared.toolsExpanded = expanded;
+				const result = originalSetToolsExpanded.call(this, expanded);
+				const mode = this as { chatContainer?: { children?: unknown[] }; streamingComponent?: unknown; streamingMessage?: unknown };
+				for (const child of mode.chatContainer?.children ?? []) {
+					if (child instanceof AssistantMessageComponent) {
+						const message = (child as unknown as { lastMessage?: unknown }).lastMessage;
+						if (message) child.updateContent(message as never);
+					}
+				}
+				if (mode.streamingComponent instanceof AssistantMessageComponent && mode.streamingMessage) {
+					mode.streamingComponent.updateContent(mode.streamingMessage as never);
+				}
+				return result;
+			};
+		}
+	}
+
+	if (!shared.assistantMessagePatchInstalled) {
+		shared.assistantMessagePatchInstalled = true;
+		const prototype = AssistantMessageComponent.prototype as unknown as {
+			updateContent: (message: any) => void;
+			hideThinkingBlock?: boolean;
+		};
+		const originalUpdateContent = prototype.updateContent;
+		prototype.updateContent = function patchedUpdateContent(this: typeof prototype, message: any) {
+			if (shouldHideReasoning()) {
+				const result = originalUpdateContent.call(this, {
+					...message,
+					content: message.content?.map(compactAssistantContent).filter(Boolean) ?? [],
+				});
+				(this as unknown as { lastMessage?: unknown }).lastMessage = message;
+				return result;
+			}
+
+			if (shared.compactMode && shared.toolsExpanded) {
+				const previousHideThinkingBlock = this.hideThinkingBlock;
+				this.hideThinkingBlock = false;
+				try {
+					return originalUpdateContent.call(this, message);
+				} finally {
+					this.hideThinkingBlock = previousHideThinkingBlock;
+				}
+			}
+
+			return originalUpdateContent.call(this, message);
+		};
+	}
 }
 
 function countDiffLines(diff: string | undefined): { added: number; removed: number } {
@@ -104,33 +209,57 @@ function emptyText(): Text {
 	return new Text("", 0, 0);
 }
 
-function textContent(result: { content: Array<{ type: string; text?: string }> }): string {
+function textContent(result: ToolResult): string {
 	return result.content.find((content) => content.type === "text")?.text ?? "";
 }
 
-function renderExpandableText(
-	result: { content: Array<{ type: string; text?: string }> },
-	expanded: boolean,
-	theme: ExtensionContext["ui"]["theme"],
-): Text {
-	if (compactMode && !expanded) return emptyText();
+function renderExpandableText(result: ToolResult, expanded: boolean, theme: ExtensionContext["ui"]["theme"]): Text {
+	if (shared.compactMode && !expanded) return emptyText();
 	const text = textContent(result).trim();
 	return new Text(text ? `\n${theme.fg("toolOutput", text)}` : "", 0, 0);
 }
 
+function registerBuiltInTool(
+	pi: ExtensionAPI,
+	name: BuiltInToolName,
+	definition: ToolDefinition,
+	renderCall: (args: any, theme: ExtensionContext["ui"]["theme"]) => string,
+): void {
+	(pi.registerTool as (tool: any) => void)({
+		name,
+		label: definition.label,
+		description: definition.description,
+		parameters: definition.parameters,
+		renderShell: "self",
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const tool = getBuiltInTools(ctx.cwd)[name] as { execute: (...args: any[]) => Promise<unknown> };
+			return tool.execute(toolCallId, params, signal, onUpdate) as never;
+		},
+		renderCall(args, theme, context) {
+			if (shared.compactMode && !context.expanded) return emptyText();
+			return new Text(renderCall(args, theme), 0, 0);
+		},
+		renderResult(result, { expanded }, theme) {
+			return renderExpandableText(result, expanded, theme);
+		},
+	});
+}
+
 export default function (pi: ExtensionAPI) {
+	installUiPatches();
+
 	pi.on("session_start", async (_event, ctx) => {
 		ctx.ui.setWorkingIndicator({
 			frames: SPINNER_FRAMES.map((frame) => ctx.ui.theme.fg("accent", frame)),
 			intervalMs: 80,
 		});
-		ctx.ui.setToolsExpanded(!compactMode);
-		ctx.ui.setStatus("compact-agent-flow", ctx.ui.theme.fg("dim", compactMode ? "Compact agent flow on" : "Compact agent flow off"));
+		setCompactMode(ctx, shared.compactMode);
+		ctx.ui.setStatus("compact-agent-flow", ctx.ui.theme.fg("dim", shared.compactMode ? "Compact agent flow on" : "Compact agent flow off"));
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
-		counters = createCounters();
-		if (compactMode) ctx.ui.setToolsExpanded(false);
+		shared.counters = createCounters();
+		setCompactMode(ctx, shared.compactMode);
 		updateWorkingUi(ctx);
 	});
 
@@ -140,15 +269,15 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		counters.toolsCalled++;
-		if (isToolCallEventType("read", event)) counters.filesRead.add(event.input.path);
-		if (isToolCallEventType("edit", event)) counters.filesEdited.add(event.input.path);
+		shared.counters.toolsCalled++;
+		if (isToolCallEventType("read", event)) shared.counters.filesRead.add(event.input.path);
+		if (isToolCallEventType("edit", event)) shared.counters.filesEdited.add(event.input.path);
 		if (isToolCallEventType("write", event)) {
-			counters.filesEdited.add(event.input.path);
-			counters.linesAdded += event.input.content.split("\n").length;
+			shared.counters.filesEdited.add(event.input.path);
+			shared.counters.linesAdded += event.input.content.split("\n").length;
 		}
-		if (isToolCallEventType("bash", event)) counters.bashCalls++;
-		if (event.toolName === "grep" || event.toolName === "find" || event.toolName === "ls") counters.searchCalls++;
+		if (isToolCallEventType("bash", event)) shared.counters.bashCalls++;
+		if (event.toolName === "grep" || event.toolName === "find" || event.toolName === "ls") shared.counters.searchCalls++;
 		updateWorkingUi(ctx);
 	});
 
@@ -156,164 +285,44 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName === "edit") {
 			const details = event.details as { diff?: string } | undefined;
 			const diffCounts = countDiffLines(details?.diff);
-			counters.linesAdded += diffCounts.added;
-			counters.linesRemoved += diffCounts.removed;
+			shared.counters.linesAdded += diffCounts.added;
+			shared.counters.linesRemoved += diffCounts.removed;
 			updateWorkingUi(ctx);
 		}
 	});
 
 	pi.registerCommand("compact-flow", {
 		description: "Toggle compact agent output flow.",
-		handler: async (_args, ctx) => {
-			compactMode = !compactMode;
-			ctx.ui.setToolsExpanded(!compactMode);
-			ctx.ui.notify(`Compact agent flow ${compactMode ? "enabled" : "disabled"}`, "info");
-			updateWorkingUi(ctx);
-		},
+		handler: async (_args, ctx) => toggleCompactMode(ctx),
 	});
 
 	pi.registerShortcut("ctrl+shift+o", {
 		description: "Toggle compact agent output flow",
-		handler: async (ctx) => {
-			compactMode = !compactMode;
-			ctx.ui.setToolsExpanded(!compactMode);
-			ctx.ui.notify(`Compact agent flow ${compactMode ? "enabled" : "disabled"}`, "info");
-		},
+		handler: async (ctx) => toggleCompactMode(ctx),
 	});
 
 	const cwd = process.cwd();
-	const read = createReadTool(cwd);
-	pi.registerTool({
-		name: "read",
-		label: read.label,
-		description: read.description,
-		parameters: read.parameters,
-		renderShell: "self",
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return getBuiltInTools(ctx.cwd).read.execute(toolCallId, params, signal, onUpdate);
-		},
-		renderCall(args, theme, context) {
-			if (compactMode && !context.expanded) return emptyText();
-			return new Text(`${theme.fg("toolTitle", theme.bold("read"))} ${theme.fg("accent", shortenPath(args.path))}`, 0, 0);
-		},
-		renderResult(result, { expanded }, theme) {
-			return renderExpandableText(result, expanded, theme);
-		},
+	registerBuiltInTool(pi, "read", createReadTool(cwd), (args, theme) =>
+		`${theme.fg("toolTitle", theme.bold("read"))} ${theme.fg("accent", shortenPath(args.path))}`,
+	);
+	registerBuiltInTool(pi, "edit", createEditTool(cwd), (args, theme) =>
+		`${theme.fg("toolTitle", theme.bold("edit"))} ${theme.fg("accent", shortenPath(args.path))}`,
+	);
+	registerBuiltInTool(pi, "write", createWriteTool(cwd), (args, theme) => {
+		const lineCount = args.content.split("\n").length;
+		return `${theme.fg("toolTitle", theme.bold("write"))} ${theme.fg("accent", shortenPath(args.path))} ${theme.fg("dim", `(${lineCount} lines)`)}`;
 	});
-
-	const edit = createEditTool(cwd);
-	pi.registerTool({
-		name: "edit",
-		label: edit.label,
-		description: edit.description,
-		parameters: edit.parameters,
-		renderShell: "self",
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return getBuiltInTools(ctx.cwd).edit.execute(toolCallId, params, signal, onUpdate);
-		},
-		renderCall(args, theme, context) {
-			if (compactMode && !context.expanded) return emptyText();
-			return new Text(`${theme.fg("toolTitle", theme.bold("edit"))} ${theme.fg("accent", shortenPath(args.path))}`, 0, 0);
-		},
-		renderResult(result, { expanded }, theme) {
-			return renderExpandableText(result, expanded, theme);
-		},
+	registerBuiltInTool(pi, "bash", createBashTool(cwd), (args, theme) => {
+		const command = args.command.length > 100 ? `${args.command.slice(0, 97)}...` : args.command;
+		return `${theme.fg("toolTitle", theme.bold("$"))} ${theme.fg("accent", command)}`;
 	});
-
-	const write = createWriteTool(cwd);
-	pi.registerTool({
-		name: "write",
-		label: write.label,
-		description: write.description,
-		parameters: write.parameters,
-		renderShell: "self",
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return getBuiltInTools(ctx.cwd).write.execute(toolCallId, params, signal, onUpdate);
-		},
-		renderCall(args, theme, context) {
-			if (compactMode && !context.expanded) return emptyText();
-			const lineCount = args.content.split("\n").length;
-			return new Text(`${theme.fg("toolTitle", theme.bold("write"))} ${theme.fg("accent", shortenPath(args.path))} ${theme.fg("dim", `(${lineCount} lines)`)}`, 0, 0);
-		},
-		renderResult(result, { expanded }, theme) {
-			return renderExpandableText(result, expanded, theme);
-		},
-	});
-
-	const bash = createBashTool(cwd);
-	pi.registerTool({
-		name: "bash",
-		label: bash.label,
-		description: bash.description,
-		parameters: bash.parameters,
-		renderShell: "self",
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return getBuiltInTools(ctx.cwd).bash.execute(toolCallId, params, signal, onUpdate);
-		},
-		renderCall(args, theme, context) {
-			if (compactMode && !context.expanded) return emptyText();
-			const command = args.command.length > 100 ? `${args.command.slice(0, 97)}...` : args.command;
-			return new Text(`${theme.fg("toolTitle", theme.bold("$"))} ${theme.fg("accent", command)}`, 0, 0);
-		},
-		renderResult(result, { expanded }, theme) {
-			return renderExpandableText(result, expanded, theme);
-		},
-	});
-
-	const grep = createGrepTool(cwd);
-	pi.registerTool({
-		name: "grep",
-		label: grep.label,
-		description: grep.description,
-		parameters: grep.parameters,
-		renderShell: "self",
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return getBuiltInTools(ctx.cwd).grep.execute(toolCallId, params, signal, onUpdate);
-		},
-		renderCall(args, theme, context) {
-			if (compactMode && !context.expanded) return emptyText();
-			return new Text(`${theme.fg("toolTitle", theme.bold("grep"))} ${theme.fg("accent", args.pattern)} ${theme.fg("dim", shortenPath(args.path))}`, 0, 0);
-		},
-		renderResult(result, { expanded }, theme) {
-			return renderExpandableText(result, expanded, theme);
-		},
-	});
-
-	const find = createFindTool(cwd);
-	pi.registerTool({
-		name: "find",
-		label: find.label,
-		description: find.description,
-		parameters: find.parameters,
-		renderShell: "self",
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return getBuiltInTools(ctx.cwd).find.execute(toolCallId, params, signal, onUpdate);
-		},
-		renderCall(args, theme, context) {
-			if (compactMode && !context.expanded) return emptyText();
-			return new Text(`${theme.fg("toolTitle", theme.bold("find"))} ${theme.fg("accent", args.pattern)} ${theme.fg("dim", shortenPath(args.path))}`, 0, 0);
-		},
-		renderResult(result, { expanded }, theme) {
-			return renderExpandableText(result, expanded, theme);
-		},
-	});
-
-	const ls = createLsTool(cwd);
-	pi.registerTool({
-		name: "ls",
-		label: ls.label,
-		description: ls.description,
-		parameters: ls.parameters,
-		renderShell: "self",
-		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return getBuiltInTools(ctx.cwd).ls.execute(toolCallId, params, signal, onUpdate);
-		},
-		renderCall(args, theme, context) {
-			if (compactMode && !context.expanded) return emptyText();
-			return new Text(`${theme.fg("toolTitle", theme.bold("ls"))} ${theme.fg("accent", shortenPath(args.path))}`, 0, 0);
-		},
-		renderResult(result, { expanded }, theme) {
-			return renderExpandableText(result, expanded, theme);
-		},
-	});
+	registerBuiltInTool(pi, "grep", createGrepTool(cwd), (args, theme) =>
+		`${theme.fg("toolTitle", theme.bold("grep"))} ${theme.fg("accent", args.pattern)} ${theme.fg("dim", shortenPath(args.path))}`,
+	);
+	registerBuiltInTool(pi, "find", createFindTool(cwd), (args, theme) =>
+		`${theme.fg("toolTitle", theme.bold("find"))} ${theme.fg("accent", args.pattern)} ${theme.fg("dim", shortenPath(args.path))}`,
+	);
+	registerBuiltInTool(pi, "ls", createLsTool(cwd), (args, theme) =>
+		`${theme.fg("toolTitle", theme.bold("ls"))} ${theme.fg("accent", shortenPath(args.path))}`,
+	);
 }
