@@ -1,24 +1,26 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 const MODELS_JSON_PATH = join(getAgentDir(), "models.json");
 const PROVIDER = "openrouter";
+const COMMAND = "openrouter-model-selector";
+
+type ModelEntry = Record<string, unknown> & { id: string; name?: string };
+
+type ProviderConfig = Record<string, unknown> & {
+	baseUrl?: string;
+	apiKey?: string;
+	api?: string;
+	headers?: Record<string, string>;
+	compat?: unknown;
+	authHeader?: boolean;
+	models?: ModelEntry[];
+	modelOverrides?: Record<string, unknown>;
+};
 
 type ModelsJson = {
-	providers: Record<
-		string,
-		{
-			baseUrl?: string;
-			apiKey?: string;
-			api?: string;
-			headers?: Record<string, string>;
-			compat?: unknown;
-			authHeader?: boolean;
-			models?: Array<Record<string, unknown> & { id: string; name?: string }>;
-			modelOverrides?: Record<string, unknown>;
-		}
-	>;
+	providers: Record<string, ProviderConfig>;
 };
 
 function emptyConfig(): ModelsJson {
@@ -64,32 +66,54 @@ async function loadModelsJson(): Promise<ModelsJson> {
 }
 
 function getCurrentIds(config: ModelsJson): string[] {
-	return (config.providers[PROVIDER]?.models ?? []).map((model) => model.id);
+	return config.providers[PROVIDER]?.models?.map((model) => model.id) ?? [];
 }
 
-function buildNextModels(existingModels: Array<Record<string, unknown> & { id: string; name?: string }>, ids: string[]) {
+function buildNextModels(existingModels: ModelEntry[], ids: string[]): ModelEntry[] {
+	if (ids.length === 0) return [];
+
 	const existingById = new Map(existingModels.map((model) => [model.id, model] as const));
 	return ids.map((id) => existingById.get(id) ?? { id, name: id });
 }
 
+function hasProviderMetadata(provider: ProviderConfig): boolean {
+	return Object.keys(provider).some((key) => key !== "models");
+}
+
 async function saveModelsJson(config: ModelsJson): Promise<void> {
+	if (Object.keys(config.providers).length === 0) {
+		try {
+			await unlink(MODELS_JSON_PATH);
+		} catch (error) {
+			if (!(error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT")) {
+				throw error;
+			}
+		}
+		return;
+	}
+
 	await mkdir(getAgentDir(), { recursive: true });
 	await writeFile(MODELS_JSON_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
+function sameIds(left: string[], right: string[]): boolean {
+	return left.length === right.length && left.every((id, index) => id === right[index]);
+}
+
 export default function (pi: ExtensionAPI) {
-	pi.registerCommand("models", {
-		description: "Edit manual OpenRouter model ids for /model and Ctrl+P cycling",
+	pi.registerCommand(COMMAND, {
+		description: "Edit manual OpenRouter model ids for /openrouter-model-selector and Ctrl+P cycling",
 		handler: async (args, ctx) => {
 			try {
 				const config = await loadModelsJson();
-				const provider = config.providers[PROVIDER] ?? {};
+				const provider: ProviderConfig = config.providers[PROVIDER] ?? {};
 				const currentIds = getCurrentIds(config);
+				const hasModelsProperty = Object.prototype.hasOwnProperty.call(provider, "models");
 
 				let input = args.trim();
 				if (!input) {
 					if (!ctx.hasUI) {
-						ctx.ui.notify("/models needs interactive mode or arguments", "error");
+						ctx.ui.notify(`/${COMMAND} needs interactive mode or arguments`, "error");
 						return;
 					}
 
@@ -106,19 +130,24 @@ export default function (pi: ExtensionAPI) {
 
 				const nextIds = parseIds(input);
 				if (nextIds.length === 0) {
+					if (!hasModelsProperty && !hasProviderMetadata(provider)) {
+						ctx.ui.notify("No manual OpenRouter models to clear", "info");
+						return;
+					}
+
 					if (currentIds.length > 0 && ctx.hasUI) {
-						const ok = await ctx.ui.confirm("Clear OpenRouter models?", "Remove all manual OpenRouter model ids?");
+						const ok = await ctx.ui.confirm(
+							"Clear OpenRouter models?",
+							"Remove all manual OpenRouter model ids?",
+						);
 						if (!ok) return;
 					}
 
-					const hasOverrideConfig =
-						provider.baseUrl !== undefined ||
-						provider.headers !== undefined ||
-						provider.compat !== undefined ||
-						(provider.modelOverrides !== undefined && Object.keys(provider.modelOverrides).length > 0);
-
-					if (hasOverrideConfig) {
+					if (hasModelsProperty) {
 						delete provider.models;
+					}
+
+					if (hasProviderMetadata(provider)) {
 						config.providers[PROVIDER] = provider;
 					} else {
 						delete config.providers[PROVIDER];
@@ -127,6 +156,11 @@ export default function (pi: ExtensionAPI) {
 					await saveModelsJson(config);
 					ctx.modelRegistry.refresh();
 					ctx.ui.notify("Cleared manual OpenRouter models", "info");
+					return;
+				}
+
+				if (sameIds(currentIds, nextIds) && hasModelsProperty) {
+					ctx.ui.notify("OpenRouter models unchanged", "info");
 					return;
 				}
 
