@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import {
 	AssistantMessageComponent,
 	InteractiveMode,
+	ToolExecutionComponent,
 	createBashTool,
 	createEditTool,
 	createFindTool,
@@ -43,6 +44,7 @@ type SharedState = {
 	toolsExpanded: boolean;
 	assistantMessagePatchInstalled: boolean;
 	interactiveModePatchInstalled: boolean;
+	toolExecutionPatchInstalled: boolean;
 };
 
 const SHARED_STATE_KEY = Symbol.for("pi.compact-agent-flow.state");
@@ -52,6 +54,7 @@ const shared = ((globalThis as unknown as Record<symbol, SharedState>)[SHARED_ST
 	toolsExpanded: false,
 	assistantMessagePatchInstalled: false,
 	interactiveModePatchInstalled: false,
+	toolExecutionPatchInstalled: false,
 });
 
 function createCounters(): Counters {
@@ -130,10 +133,30 @@ function shouldHideReasoning(): boolean {
 	return shared.compactMode && !shared.toolsExpanded;
 }
 
+function textSignaturePhase(signature: string | undefined): "commentary" | "final_answer" | undefined {
+	if (!signature?.startsWith("{")) return undefined;
+	try {
+		const parsed = JSON.parse(signature) as { phase?: unknown };
+		return parsed.phase === "commentary" || parsed.phase === "final_answer" ? parsed.phase : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function stripReasoningText(text: string): string {
+	return text
+		.replace(/<think>[\s\S]*?<\/think>/gi, "")
+		.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+		.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, "")
+		.trim();
+}
+
 function compactAssistantContent(content: any): any {
-	if (content.type === "thinking") return undefined;
+	if (content.type === "thinking" || content.type === "reasoning") return undefined;
 	if (content.type === "text" && typeof content.text === "string") {
-		return { ...content, text: content.text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() };
+		if (textSignaturePhase(content.textSignature) === "commentary") return undefined;
+		const text = stripReasoningText(content.text);
+		return text ? { ...content, text } : undefined;
 	}
 	return content;
 }
@@ -160,6 +183,16 @@ function installUiPatches(): void {
 				return result;
 			};
 		}
+	}
+
+	if (!shared.toolExecutionPatchInstalled) {
+		shared.toolExecutionPatchInstalled = true;
+		const prototype = ToolExecutionComponent.prototype as unknown as { render: (width: number) => string[] };
+		const originalRender = prototype.render;
+		prototype.render = function patchedToolExecutionRender(this: unknown, width: number): string[] {
+			if (shouldHideReasoning()) return [];
+			return originalRender.call(this, width);
+		};
 	}
 
 	if (!shared.assistantMessagePatchInstalled) {
