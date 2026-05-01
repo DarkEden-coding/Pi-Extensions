@@ -2,7 +2,6 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
-import { StringEnum } from "@mariozechner/pi-ai";
 import { getAgentDir, type ExtensionAPI, withFileMutationQueue } from "@mariozechner/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
@@ -43,8 +42,8 @@ const VIEWER_WARNING = "Edits are saved now but only affect new chats, not the c
 const MAX_VISIBLE_MEMORIES = 8;
 
 const MemoryParams = Type.Object({
-	action: StringEnum(MEMORY_ACTIONS),
-	scope: StringEnum(MEMORY_SCOPES),
+	action: Type.Union(MEMORY_ACTIONS.map((action) => Type.Literal(action))),
+	scope: Type.Union(MEMORY_SCOPES.map((scope) => Type.Literal(scope))),
 	id: Type.Optional(Type.Number({ description: "Memory id for update/remove" })),
 	text: Type.Optional(Type.String({ description: "Memory text" })),
 });

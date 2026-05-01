@@ -1,37 +1,45 @@
-import { complete } from "@mariozechner/pi-ai";
 import { DynamicBorder } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Container, Input, Key, matchesKey, truncateToWidth, type Component, type Focusable } from "@mariozechner/pi-tui";
-import type { Model } from "@mariozechner/pi-ai";
+
+type InputAbility = "text" | "image";
+type ModelLike = {
+	provider: string;
+	id: string;
+	name?: string;
+	api: string;
+	input?: InputAbility[];
+};
 
 type StoredChoice = { provider: string; id: string };
+type MessageContent = { type: string; text?: string };
 
 const CUSTOM_TYPE = "image-analysis-handoff";
 
-function modelKey(model: Model<any>) {
+function modelKey(model: ModelLike) {
 	return `${model.provider}/${model.id}`;
 }
 
-function supportsImages(model: Model<any>) {
+function supportsImages(model: ModelLike) {
 	return Array.isArray(model.input) && model.input.includes("image");
 }
 
-function searchableText(model: Model<any>) {
+function searchableText(model: ModelLike) {
 	return `${model.provider}/${model.id} ${model.name ?? ""}`.toLowerCase();
 }
 
 class ModelSearchPicker implements Component, Focusable {
 	private input = new Input();
-	private filtered: Model<any>[];
+	private filtered: ModelLike[];
 	private selected = 0;
 	private container = new Container();
 	private _focused = false;
 
 	constructor(
-		private models: Model<any>[],
+		private models: ModelLike[],
 		private theme: any,
 		private requestRender: () => void,
-		private done: (model: Model<any> | null) => void,
+		private done: (model: ModelLike | null) => void,
 	) {
 		this.filtered = models;
 	}
@@ -104,7 +112,7 @@ class ModelSearchPicker implements Component, Focusable {
 		const end = Math.min(start + visible, this.filtered.length);
 		const lines: string[] = [];
 		for (let i = start; i < end; i++) {
-			const model = this.filtered[i];
+			const model = this.filtered[i]!;
 			const isSelected = i === this.selected;
 			const label = `${modelKey(model)} ${supportsImages(model) ? "[image]" : "[text-only]"}${model.name ? ` — ${model.name}` : ""}`;
 			const line = truncateToWidth(`${isSelected ? "→" : " "} ${label}`, width);
@@ -130,13 +138,13 @@ export default function imageAnalysisHandoff(pi: ExtensionAPI) {
 	pi.registerCommand("image-analysis-model", {
 		description: "Search all available models and select the vision model used to analyze attached images",
 		handler: async (_args, ctx) => {
-			const allModels = ctx.modelRegistry.getAvailable();
+			const allModels = ctx.modelRegistry.getAvailable() as ModelLike[];
 			if (allModels.length === 0) {
 				ctx.ui.notify("No authenticated models found.", "warning");
 				return;
 			}
 
-			const model = await ctx.ui.custom<Model<any> | null>(
+			const model = await ctx.ui.custom<ModelLike | null>(
 				(tui, theme, _keybindings, done) => new ModelSearchPicker(allModels, theme, () => tui.requestRender(), done),
 				{ overlay: true, overlayOptions: { width: "80%", maxHeight: "80%" } },
 			);
@@ -156,8 +164,8 @@ export default function imageAnalysisHandoff(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!event.images?.length) return;
 
-		let model: Model<any> | undefined;
-		if (selected) model = ctx.modelRegistry.find(selected.provider, selected.id);
+		let model: ModelLike | undefined;
+		if (selected) model = ctx.modelRegistry.find(selected.provider, selected.id) as ModelLike | undefined;
 
 		if (!model) {
 			ctx.ui.notify("Attached images were not pre-analyzed: no image analysis model selected. Run /image-analysis-model.", "warning");
@@ -168,7 +176,7 @@ export default function imageAnalysisHandoff(pi: ExtensionAPI) {
 			return;
 		}
 
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model as never);
 		if (!auth.ok || !auth.apiKey) {
 			ctx.ui.notify(`Image analysis auth failed for ${modelKey(model)}: ${auth.ok ? "missing API key" : auth.error}`, "warning");
 			return;
@@ -176,29 +184,26 @@ export default function imageAnalysisHandoff(pi: ExtensionAPI) {
 
 		ctx.ui.setStatus("image-analysis", `Analyzing ${event.images.length} image(s) with ${modelKey(model)}...`);
 		try {
-			const response = await complete(
-				model,
-				{
-					messages: [
-						{
-							role: "user" as const,
-							content: [
-								{
-									type: "text" as const,
-									text: `Analyze all attached images for the next coding-agent model. Use the user's prompt as context so you extract only relevant visual details.\n\nUser prompt:\n${event.prompt}\n\nReturn concise markdown with: visible text, UI/code/diagram details, relationships between images, and any uncertainties.`,
-								},
-								...event.images,
-							],
-							timestamp: Date.now(),
-						},
-					],
-				},
-				{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: 2048, signal: ctx.signal },
-			);
+			const { complete } = await import("@mariozechner/pi-ai");
+			const response = await complete(model as never, {
+				messages: [
+					{
+						role: "user" as const,
+						content: [
+							{
+								type: "text" as const,
+								text: `Analyze all attached images for the next coding-agent model. Use the user's prompt as context so you extract only relevant visual details.\n\nUser prompt:\n${event.prompt}\n\nReturn concise markdown with: visible text, UI/code/diagram details, relationships between images, and any uncertainties.`,
+							},
+							...event.images,
+						],
+						timestamp: Date.now(),
+					},
+				],
+			}, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: 2048, signal: ctx.signal });
 
 			const analysis = response.content
-				.filter((c): c is { type: "text"; text: string } => c.type === "text")
-				.map((c) => c.text)
+				.filter((c: MessageContent): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
+				.map((c: { text: string }) => c.text)
 				.join("\n")
 				.trim();
 

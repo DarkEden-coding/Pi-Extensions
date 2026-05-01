@@ -1,44 +1,7 @@
 import { Type } from "@sinclair/typebox";
-import { type ExtensionAPI, truncateHead, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "@mariozechner/pi-coding-agent";
-import fs from "fs";
-import path from "path";
-
-// Manage keys in ~/.pi/agent/api-keys.json
-const KEYS_FILE = path.join(process.env.HOME || process.env.USERPROFILE || "", ".pi", "agent", "api-keys.json");
-
-function loadKeys() {
-  try {
-    if (fs.existsSync(KEYS_FILE)) {
-      return JSON.parse(fs.readFileSync(KEYS_FILE, "utf-8"));
-    }
-  } catch (e) {
-    // Ignore
-  }
-  return {};
-}
-
-function saveKeys(keys: Record<string, string>) {
-  try {
-    fs.mkdirSync(path.dirname(KEYS_FILE), { recursive: true });
-    fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2), "utf-8");
-  } catch (e) {
-    // Ignore
-  }
-}
-
-export function getApiKey(service: "brave" | "context7"): string | undefined {
-  const envKey = service === "brave" ? process.env.BRAVE_API_KEY : process.env.CONTEXT7_API_KEY;
-  if (envKey) return envKey;
-  
-  const keys = loadKeys();
-  return keys[service];
-}
-
-export function setApiKey(service: "brave" | "context7", key: string) {
-  const keys = loadKeys();
-  keys[service] = key;
-  saveKeys(keys);
-}
+import { type ExtensionAPI, truncateHead, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES, formatSize } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
+import { getApiKey, loadKeys, renderTruncatedToolResult, saveKeys } from "./lib/search-shared.js";
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("set-keys", {
@@ -74,6 +37,11 @@ export default function (pi: ExtensionAPI) {
       context_threshold_mode: Type.Optional(Type.String({ description: "Relevance threshold: strict, balanced (default), lenient, disabled" })),
     }),
     
+    renderCall(args, theme, context) {
+      if (!context.expanded) return undefined;
+      return new Text(`${theme.fg("toolTitle", theme.bold("brave"))} ${theme.fg("accent", args.q)}`, 0, 0);
+    },
+    renderResult: renderTruncatedToolResult,
     async execute(_toolCallId, params, signal, onUpdate, _ctx) {
       const apiKey = getApiKey("brave");
       if (!apiKey) {

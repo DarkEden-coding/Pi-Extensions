@@ -1,7 +1,7 @@
 import { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { StringEnum } from "@mariozechner/pi-ai";
-import { getApiKey } from "./brave-search.js";
+import { Text } from "@mariozechner/pi-tui";
+import { getApiKey, renderTruncatedToolResult } from "./lib/search-shared.js";
 
 const API_BASE = "https://context7.com/api/v2";
 
@@ -30,6 +30,12 @@ export default function (pi: ExtensionAPI) {
       libraryName: Type.String({ description: "Name of the library to search for (e.g., 'react', 'next.js')" }),
       query: Type.Optional(Type.String({ description: "Optional query to find the most relevant library based on what you want to do" })),
     }),
+    renderCall(args, theme, context) {
+      if (!context.expanded) return undefined;
+      const query = args.query ? ` ${theme.fg("dim", String(args.query))}` : "";
+      return new Text(`${theme.fg("toolTitle", theme.bold("context7 search"))} ${theme.fg("accent", args.libraryName)}${query}`, 0, 0);
+    },
+    renderResult: renderTruncatedToolResult,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const apiKey = getApiKey("context7");
       if (!apiKey) throw new Error("Context7 API Key not set. Use /set-keys to configure.");
@@ -67,6 +73,11 @@ export default function (pi: ExtensionAPI) {
       query: Type.String({ description: "The specific question or topic to get documentation for" }),
       type: Type.Optional(Type.String({ description: "Format: json or markdown" })),
     }),
+    renderCall(args, theme, context) {
+      if (!context.expanded) return undefined;
+      return new Text(`${theme.fg("toolTitle", theme.bold("context7 context"))} ${theme.fg("accent", args.libraryId)} ${theme.fg("dim", String(args.query))}`, 0, 0);
+    },
+    renderResult: renderTruncatedToolResult,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
        const apiKey = getApiKey("context7");
        if (!apiKey) throw new Error("Context7 API Key not set. Use /set-keys to configure.");
