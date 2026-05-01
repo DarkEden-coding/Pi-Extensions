@@ -1,8 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
-	AssistantMessageComponent,
-	InteractiveMode,
-	ToolExecutionComponent,
 	createBashTool,
 	createEditTool,
 	createFindTool,
@@ -34,6 +31,15 @@ type ToolDefinition = {
 	description: string;
 	parameters: unknown;
 };
+type AssistantContent = {
+	type: string;
+	text?: string;
+	textSignature?: string;
+};
+type AssistantMessageLike = {
+	role: string;
+	content?: AssistantContent[];
+};
 
 const toolCache = new Map<string, BuiltInTools>();
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -42,9 +48,6 @@ type SharedState = {
 	counters: Counters;
 	compactMode: boolean;
 	toolsExpanded: boolean;
-	assistantMessagePatchInstalled: boolean;
-	interactiveModePatchInstalled: boolean;
-	toolExecutionPatchInstalled: boolean;
 };
 
 const SHARED_STATE_KEY = Symbol.for("pi.compact-agent-flow.state");
@@ -52,9 +55,6 @@ const shared = ((globalThis as unknown as Record<symbol, SharedState>)[SHARED_ST
 	counters: createCounters(),
 	compactMode: true,
 	toolsExpanded: false,
-	assistantMessagePatchInstalled: false,
-	interactiveModePatchInstalled: false,
-	toolExecutionPatchInstalled: false,
 });
 
 function createCounters(): Counters {
@@ -90,10 +90,15 @@ function getBuiltInTools(cwd: string): BuiltInTools {
 	return tools;
 }
 
-function shortenPath(path: string | undefined): string {
-	if (!path) return "…";
+function str(value: unknown): string {
+	return typeof value === "string" ? value : "";
+}
+
+function shortenPath(path: unknown): string {
+	const text = str(path);
+	if (!text) return "…";
 	const home = homedir();
-	return path.startsWith(home) ? `~${path.slice(home.length)}` : path;
+	return text.startsWith(home) ? `~${text.slice(home.length)}` : text;
 }
 
 function compactSummary(): string {
@@ -151,7 +156,7 @@ function stripReasoningText(text: string): string {
 		.trim();
 }
 
-function compactAssistantContent(content: any): any {
+function compactAssistantContent(content: AssistantContent): AssistantContent | undefined {
 	if (content.type === "thinking" || content.type === "reasoning") return undefined;
 	if (content.type === "text" && typeof content.text === "string") {
 		if (textSignaturePhase(content.textSignature) === "commentary") return undefined;
@@ -161,70 +166,12 @@ function compactAssistantContent(content: any): any {
 	return content;
 }
 
-function installUiPatches(): void {
-	if (!shared.interactiveModePatchInstalled) {
-		shared.interactiveModePatchInstalled = true;
-		const prototype = InteractiveMode.prototype as unknown as { setToolsExpanded?: (expanded: boolean) => void };
-		const originalSetToolsExpanded = prototype.setToolsExpanded;
-		if (typeof originalSetToolsExpanded === "function") {
-			prototype.setToolsExpanded = function patchedSetToolsExpanded(this: unknown, expanded: boolean) {
-				shared.toolsExpanded = expanded;
-				const result = originalSetToolsExpanded.call(this, expanded);
-				const mode = this as { chatContainer?: { children?: unknown[] }; streamingComponent?: unknown; streamingMessage?: unknown };
-				for (const child of mode.chatContainer?.children ?? []) {
-					if (child instanceof AssistantMessageComponent) {
-						const message = (child as unknown as { lastMessage?: unknown }).lastMessage;
-						if (message) child.updateContent(message as never);
-					}
-				}
-				if (mode.streamingComponent instanceof AssistantMessageComponent && mode.streamingMessage) {
-					mode.streamingComponent.updateContent(mode.streamingMessage as never);
-				}
-				return result;
-			};
-		}
-	}
-
-	if (!shared.toolExecutionPatchInstalled) {
-		shared.toolExecutionPatchInstalled = true;
-		const prototype = ToolExecutionComponent.prototype as unknown as { render: (width: number) => string[] };
-		const originalRender = prototype.render;
-		prototype.render = function patchedToolExecutionRender(this: unknown, width: number): string[] {
-			if (shouldHideReasoning()) return [];
-			return originalRender.call(this, width);
-		};
-	}
-
-	if (!shared.assistantMessagePatchInstalled) {
-		shared.assistantMessagePatchInstalled = true;
-		const prototype = AssistantMessageComponent.prototype as unknown as {
-			updateContent: (message: any) => void;
-			hideThinkingBlock?: boolean;
-		};
-		const originalUpdateContent = prototype.updateContent;
-		prototype.updateContent = function patchedUpdateContent(this: typeof prototype, message: any) {
-			if (shouldHideReasoning()) {
-				const result = originalUpdateContent.call(this, {
-					...message,
-					content: message.content?.map(compactAssistantContent).filter(Boolean) ?? [],
-				});
-				(this as unknown as { lastMessage?: unknown }).lastMessage = message;
-				return result;
-			}
-
-			if (shared.compactMode && shared.toolsExpanded) {
-				const previousHideThinkingBlock = this.hideThinkingBlock;
-				this.hideThinkingBlock = false;
-				try {
-					return originalUpdateContent.call(this, message);
-				} finally {
-					this.hideThinkingBlock = previousHideThinkingBlock;
-				}
-			}
-
-			return originalUpdateContent.call(this, message);
-		};
-	}
+function compactAssistantMessage<T extends AssistantMessageLike>(message: T): T {
+	if (!shouldHideReasoning() || message.role !== "assistant") return message;
+	return {
+		...message,
+		content: message.content?.map(compactAssistantContent).filter((content) => content !== undefined) ?? [],
+	};
 }
 
 function countDiffLines(diff: string | undefined): { added: number; removed: number } {
@@ -238,38 +185,34 @@ function countDiffLines(diff: string | undefined): { added: number; removed: num
 	return { added, removed };
 }
 
-function emptyText(): Text {
-	return new Text("", 0, 0);
-}
-
 function textContent(result: ToolResult): string {
 	return result.content.find((content) => content.type === "text")?.text ?? "";
 }
 
-function renderExpandableText(result: ToolResult, expanded: boolean, theme: ExtensionContext["ui"]["theme"]): Text {
-	if (shared.compactMode && !expanded) return emptyText();
+function renderExpandableText(result: ToolResult, expanded: boolean, theme: ExtensionContext["ui"]["theme"]): Text | undefined {
+	if (shared.compactMode && !expanded) return undefined;
 	const text = textContent(result).trim();
-	return new Text(text ? `\n${theme.fg("toolOutput", text)}` : "", 0, 0);
+	return text ? new Text(`\n${theme.fg("toolOutput", text)}`, 0, 0) : undefined;
 }
 
 function registerBuiltInTool(
 	pi: ExtensionAPI,
 	name: BuiltInToolName,
 	definition: ToolDefinition,
-	renderCall: (args: any, theme: ExtensionContext["ui"]["theme"]) => string,
+	renderCall: (args: Record<string, unknown>, theme: ExtensionContext["ui"]["theme"]) => string,
 ): void {
-	(pi.registerTool as (tool: any) => void)({
+	(pi.registerTool as (tool: unknown) => void)({
 		name,
 		label: definition.label,
 		description: definition.description,
 		parameters: definition.parameters,
 		renderShell: "self",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const tool = getBuiltInTools(ctx.cwd)[name] as { execute: (...args: any[]) => Promise<unknown> };
+			const tool = getBuiltInTools(ctx.cwd)[name] as { execute: (...args: unknown[]) => Promise<unknown> };
 			return tool.execute(toolCallId, params, signal, onUpdate) as never;
 		},
 		renderCall(args, theme, context) {
-			if (shared.compactMode && !context.expanded) return emptyText();
+			if (shared.compactMode && !context.expanded) return undefined;
 			return new Text(renderCall(args, theme), 0, 0);
 		},
 		renderResult(result, { expanded }, theme) {
@@ -279,8 +222,6 @@ function registerBuiltInTool(
 }
 
 export default function (pi: ExtensionAPI) {
-	installUiPatches();
-
 	pi.on("session_start", async (_event, ctx) => {
 		ctx.ui.setWorkingIndicator({
 			frames: SPINNER_FRAMES.map((frame) => ctx.ui.theme.fg("accent", frame)),
@@ -295,6 +236,9 @@ export default function (pi: ExtensionAPI) {
 		setCompactMode(ctx, shared.compactMode);
 		updateWorkingUi(ctx);
 	});
+
+	pi.on("message_update", async (event) => ({ message: compactAssistantMessage(event.message) }));
+	pi.on("message_end", async (event) => ({ message: compactAssistantMessage(event.message) }));
 
 	pi.on("agent_end", async (_event, ctx) => {
 		ctx.ui.setWorkingMessage();
@@ -342,18 +286,20 @@ export default function (pi: ExtensionAPI) {
 		`${theme.fg("toolTitle", theme.bold("edit"))} ${theme.fg("accent", shortenPath(args.path))}`,
 	);
 	registerBuiltInTool(pi, "write", createWriteTool(cwd), (args, theme) => {
-		const lineCount = args.content.split("\n").length;
+		const content = str(args.content);
+		const lineCount = content.split("\n").length;
 		return `${theme.fg("toolTitle", theme.bold("write"))} ${theme.fg("accent", shortenPath(args.path))} ${theme.fg("dim", `(${lineCount} lines)`)}`;
 	});
 	registerBuiltInTool(pi, "bash", createBashTool(cwd), (args, theme) => {
-		const command = args.command.length > 100 ? `${args.command.slice(0, 97)}...` : args.command;
+		const rawCommand = str(args.command);
+		const command = rawCommand.length > 100 ? `${rawCommand.slice(0, 97)}...` : rawCommand;
 		return `${theme.fg("toolTitle", theme.bold("$"))} ${theme.fg("accent", command)}`;
 	});
 	registerBuiltInTool(pi, "grep", createGrepTool(cwd), (args, theme) =>
-		`${theme.fg("toolTitle", theme.bold("grep"))} ${theme.fg("accent", args.pattern)} ${theme.fg("dim", shortenPath(args.path))}`,
+		`${theme.fg("toolTitle", theme.bold("grep"))} ${theme.fg("accent", str(args.pattern))} ${theme.fg("dim", shortenPath(args.path))}`,
 	);
 	registerBuiltInTool(pi, "find", createFindTool(cwd), (args, theme) =>
-		`${theme.fg("toolTitle", theme.bold("find"))} ${theme.fg("accent", args.pattern)} ${theme.fg("dim", shortenPath(args.path))}`,
+		`${theme.fg("toolTitle", theme.bold("find"))} ${theme.fg("accent", str(args.pattern))} ${theme.fg("dim", shortenPath(args.path))}`,
 	);
 	registerBuiltInTool(pi, "ls", createLsTool(cwd), (args, theme) =>
 		`${theme.fg("toolTitle", theme.bold("ls"))} ${theme.fg("accent", shortenPath(args.path))}`,
