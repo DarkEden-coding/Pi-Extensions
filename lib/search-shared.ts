@@ -1,5 +1,5 @@
-import { truncateHead, DEFAULT_MAX_BYTES } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { truncateHead, DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import fs from "fs";
 import path from "path";
 

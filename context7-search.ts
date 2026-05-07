@@ -1,6 +1,6 @@
-import { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@mariozechner/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { getApiKey, renderTruncatedToolResult } from "./lib/search-shared.js";
 
 const API_BASE = "https://context7.com/api/v2";
@@ -28,12 +28,11 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Search for programming libraries in Context7 by name",
     parameters: Type.Object({
       libraryName: Type.String({ description: "Name of the library to search for (e.g., 'react', 'next.js')" }),
-      query: Type.Optional(Type.String({ description: "Optional query to find the most relevant library based on what you want to do" })),
+      queries: Type.Array(Type.String({ description: "Queries to find the most relevant documentation snippets" })),
     }),
     renderCall(args, theme, context) {
       if (!context.expanded) return undefined;
-      const query = args.query ? ` ${theme.fg("dim", String(args.query))}` : "";
-      return new Text(`${theme.fg("toolTitle", theme.bold("context7 search"))} ${theme.fg("accent", args.libraryName)}${query}`, 0, 0);
+      return new Text(`${theme.fg("toolTitle", theme.bold("context7 search"))} ${theme.fg("accent", args.libraryName)} ${theme.fg("dim", args.queries.join(", "))}`, 0, 0);
     },
     renderResult: renderTruncatedToolResult,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -41,28 +40,51 @@ export default function (pi: ExtensionAPI) {
       if (!apiKey) throw new Error("Context7 API Key not set. Use /set-keys to configure.");
       
       try {
-        const url = new URL(`${API_BASE}/libs/search`);
-        url.searchParams.append("libraryName", params.libraryName);
-        if (params.query) url.searchParams.append("query", params.query);
-
-        const response = await fetch(url.toString(), { headers: headers(), signal });
+        // Step 1: Find the library
+        const searchUrl = new URL(`${API_BASE}/libs/search`);
+        searchUrl.searchParams.append("libraryName", params.libraryName);
         
-        if (!response.ok) {
-          throw new Error(`API Error: ${response.status} ${response.statusText}`);
+        const searchResponse = await fetch(searchUrl.toString(), { headers: headers(), signal });
+        if (!searchResponse.ok) {
+          throw new Error(`Library search failed: ${searchResponse.status} ${searchResponse.statusText}`);
+        }
+        const searchData = await searchResponse.json();
+        const library = searchData.libraries?.[0] || searchData[0]; // Handle different possible response structures
+
+        if (!library || !library.id) {
+          return {
+            content: [{ type: "text", text: `Library "${params.libraryName}" not found.` }],
+            details: searchData
+          };
         }
 
-        const data = await response.json();
+        const libraryId = library.id;
+
+        // Step 2: Execute multiple context queries in parallel
+        const contextResults = await Promise.all(params.queries.map(async (query) => {
+          const url = new URL(`${API_BASE}/context`);
+          url.searchParams.append("libraryId", libraryId);
+          url.searchParams.append("query", query);
+          url.searchParams.append("type", "json");
+
+          const response = await fetch(url.toString(), { headers: headers(), signal });
+          if (!response.ok) {
+            return { query, error: `API Error: ${response.status} ${response.statusText}` };
+          }
+          return { query, data: await response.json() };
+        }));
+
         return {
-          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-          details: data
+          content: [{ type: "text", text: JSON.stringify({ library, results: contextResults }, null, 2) }],
+          details: { library, results: contextResults }
         };
       } catch (error: any) {
-        throw new Error(`Fetch error: ${error.message}`);
+        throw new Error(`Search error: ${error.message}`);
       }
     }
   });
 
-  // Get Context Tool
+  // Get Context Tool (also updated for parallel)
   pi.registerTool({
     name: "context7_get_context",
     label: "Context7 Get Context",
@@ -70,12 +92,12 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Retrieve documentation snippets for a specific library from Context7",
     parameters: Type.Object({
       libraryId: Type.String({ description: "The ID of the library from a previous search (e.g., '/vercel/next.js')" }),
-      query: Type.String({ description: "The specific question or topic to get documentation for" }),
+      queries: Type.Array(Type.String({ description: "Specific questions or topics to get documentation for" })),
       type: Type.Optional(Type.String({ description: "Format: json or markdown" })),
     }),
     renderCall(args, theme, context) {
       if (!context.expanded) return undefined;
-      return new Text(`${theme.fg("toolTitle", theme.bold("context7 context"))} ${theme.fg("accent", args.libraryId)} ${theme.fg("dim", String(args.query))}`, 0, 0);
+      return new Text(`${theme.fg("toolTitle", theme.bold("context7 context"))} ${theme.fg("accent", args.libraryId)} ${theme.fg("dim", args.queries.join(", "))}`, 0, 0);
     },
     renderResult: renderTruncatedToolResult,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -83,22 +105,25 @@ export default function (pi: ExtensionAPI) {
        if (!apiKey) throw new Error("Context7 API Key not set. Use /set-keys to configure.");
 
        try {
-        const url = new URL(`${API_BASE}/context`);
-        url.searchParams.append("libraryId", params.libraryId);
-        url.searchParams.append("query", params.query);
-        url.searchParams.append("type", params.type || "json");
+        const results = await Promise.all(params.queries.map(async (query) => {
+          const url = new URL(`${API_BASE}/context`);
+          url.searchParams.append("libraryId", params.libraryId);
+          url.searchParams.append("query", query);
+          url.searchParams.append("type", params.type || "json");
 
-        const response = await fetch(url.toString(), { headers: headers(), signal });
-        
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => null);
-          throw new Error(`API Error: ${response.status} ${response.statusText}\n${errorData ? JSON.stringify(errorData) : ''}`);
-        }
+          const response = await fetch(url.toString(), { headers: headers(), signal });
+          
+          if (!response.ok) {
+            const errorData = await response.json().catch(() => null);
+            return { query, error: `API Error: ${response.status} ${response.statusText}${errorData ? ` - ${JSON.stringify(errorData)}` : ''}` };
+          }
 
-        const data = await response.json();
+          return { query, data: await response.json() };
+        }));
+
         return {
-          content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-          details: data
+          content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+          details: results
         };
       } catch (error: any) {
         throw new Error(`Fetch error: ${error.message}`);

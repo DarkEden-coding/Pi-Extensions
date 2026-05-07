@@ -1,6 +1,6 @@
-import { DynamicBorder } from "@mariozechner/pi-coding-agent";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Container, Input, Key, matchesKey, truncateToWidth, type Component, type Focusable } from "@mariozechner/pi-tui";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Container, Input, Key, matchesKey, truncateToWidth, type Component, type Focusable } from "@earendil-works/pi-tui";
 
 type InputAbility = "text" | "image";
 type ModelLike = {
@@ -184,7 +184,7 @@ export default function imageAnalysisHandoff(pi: ExtensionAPI) {
 
 		ctx.ui.setStatus("image-analysis", `Analyzing ${event.images.length} image(s) with ${modelKey(model)}...`);
 		try {
-			const { complete } = await import("@mariozechner/pi-ai");
+			const { complete } = await import("@earendil-works/pi-ai");
 			const response = await complete(model as never, {
 				messages: [
 					{

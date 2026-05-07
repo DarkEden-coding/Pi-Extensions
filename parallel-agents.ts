@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Api, Model } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	AuthStorage,
 	createAgentSession,
@@ -11,7 +11,7 @@ import {
 	SettingsManager,
 	type ExtensionAPI,
 	type ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -368,6 +368,7 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 			const config = loadConfig();
 			while (true) {
 				const action = await ctx.ui.select("Parallel agents", [
+					"List profiles",
 					"Add profile",
 					"Edit profile",
 					"Delete profile",
@@ -377,7 +378,14 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 				]);
 				if (!action || action === "Done") break;
 
-				if (action === "Add profile") {
+				if (action === "List profiles") {
+					if (config.profiles.length === 0) {
+						ctx.ui.notify("No profiles configured.", "info");
+					} else {
+						const list = config.profiles.map(p => `- ${p.name} (${p.provider}/${p.model}, thinking: ${p.thinkingLevel})`).join("\n");
+						ctx.ui.notify(`Current profiles:\n${list}`, "info");
+					}
+				} else if (action === "Add profile") {
 					const profile = await selectModelProfile(ctx);
 					if (profile) {
 						config.profiles = config.profiles.filter((p) => p.name !== profile.name);
@@ -393,13 +401,46 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 					const selected = await ctx.ui.select("Select profile", config.profiles.map((p) => p.name));
 					const existing = selected ? findProfile(config, selected) : undefined;
 					if (!existing) continue;
-					const profile = await selectModelProfile(ctx, existing);
-					if (profile) {
-						config.profiles = config.profiles.filter((p) => p.name !== existing.name && p.name !== profile.name);
-						config.profiles.push(profile);
-						saveConfig(config);
-						ctx.ui.notify(`Saved profile ${profile.name}`, "info");
+
+					const editAction = await ctx.ui.select("Select field to edit", ["Name", "Provider/Model", "Thinking Level"]);
+					if (!editAction) continue;
+
+					let profile = { ...existing };
+					if (editAction === "Name") {
+						const name = await ctx.ui.input("Profile name", existing.name);
+						if (!name?.trim()) continue;
+						profile.name = name.trim();
+					} else if (editAction === "Provider/Model") {
+						const available = ctx.modelRegistry.getAvailable();
+						const providers = [...new Set(available.map((m) => m.provider))].sort();
+						const provider = await ctx.ui.select("Select provider", providers);
+						if (!provider) continue;
+
+						const providerModels = available.filter((m) => m.provider === provider).sort((a, b) => a.id.localeCompare(b.id));
+						const modelId = await ctx.ui.select(
+							`Select model (${provider})`,
+							providerModels.map((m) => m.id),
+						);
+						if (!modelId) continue;
+						profile.provider = provider;
+						profile.model = modelId;
+					} else if (editAction === "Thinking Level") {
+						const available = ctx.modelRegistry.getAvailable();
+						const model = available.find((m) => m.provider === profile.provider && m.id === profile.model) as Model<Api> | undefined;
+						if (!model) {
+							ctx.ui.notify(`Model ${profile.provider}/${profile.model} not available`, "error");
+							continue;
+						}
+						const levels = getSupportedThinkingLevelsLocal(model);
+						const thinkingLevel = (await ctx.ui.select("Select thinking level", levels)) as ThinkingLevel | undefined;
+						if (!thinkingLevel) continue;
+						profile.thinkingLevel = thinkingLevel;
 					}
+
+					config.profiles = config.profiles.filter((p) => p.name !== existing.name && p.name !== profile.name);
+					config.profiles.push(profile);
+					saveConfig(config);
+					ctx.ui.notify(`Saved profile ${profile.name}`, "info");
 				} else if (action === "Delete profile") {
 					if (config.profiles.length === 0) {
 						ctx.ui.notify("No profiles to delete", "warning");
