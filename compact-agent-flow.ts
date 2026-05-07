@@ -277,11 +277,11 @@ function registerBuiltInTool(
 			return tool.execute(toolCallId, params, signal, onUpdate) as never;
 		},
 		renderCall(args, theme, context) {
-			if (shared.compactMode && !context.expanded) return undefined;
+			if (shared.compactMode && !context.expanded) return new Text("", 0, 0); // must return a Component
 			return new Text(renderCall(args, theme), 0, 0);
 		},
 		renderResult(result, { expanded }, theme) {
-			return renderExpandableText(result, expanded, theme);
+			return renderExpandableText(result, expanded, theme) ?? new Text("", 0, 0); // must return a Component
 		},
 	});
 }
