@@ -3,7 +3,7 @@ import { type ExtensionAPI, truncateHead, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES, 
 import { Text } from "@earendil-works/pi-tui";
 import { getApiKey, loadKeys, renderTruncatedToolResult, saveKeys } from "./lib/search-shared.js";
 
-export default function (pi: ExtensionAPI) {
+export default function braveSearch(pi: ExtensionAPI) {
   pi.registerCommand("set-keys", {
     description: "Set API keys for extensions (Brave, Context7)",
     handler: async (_args, ctx) => {
@@ -83,18 +83,22 @@ export default function (pi: ExtensionAPI) {
 
       for (const { query, data } of results) {
         resultText += `# Results for: ${query}\n\n`;
+        constGenericResults(query, data);
+      }
+
+      function constGenericResults(query: string, data: any) {
         if (!data.grounding?.generic || data.grounding.generic.length === 0) {
           resultText += "No relevant web content found.\n\n";
-          continue;
+          return;
         }
 
         totalResultsCount += data.grounding.generic.length;
         for (const item of data.grounding.generic) {
           resultText += `## ${item.title} (${item.url})\n\n`;
           for (const snippet of item.snippets) {
-              resultText += `${snippet}\n\n`;
+            resultText += `${snippet}\n\n`;
           }
-          resultText += `---\n\n`;
+          resultText += "---\n\n";
         }
       }
       
