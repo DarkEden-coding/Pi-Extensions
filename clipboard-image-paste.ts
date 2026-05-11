@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -23,6 +24,17 @@ type PendingImage = {
 
 let nextImageId = 1;
 let pendingImages: PendingImage[] = [];
+
+type ClipboardPasteContext = {
+	cwd: string;
+	ui: {
+		pasteToEditor(text: string): void;
+		notify(message: string, type?: "info" | "warning" | "error"): void;
+		getEditorText(): string;
+		setEditorText(text: string): void;
+		setWidget(key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
+	};
+};
 
 function quotePowerShellSingle(value: string): string {
 	return `'${value.replace(/'/g, "''")}'`;
@@ -127,7 +139,55 @@ function imageBlock(image: PendingImage): ImageBlock {
 	};
 }
 
-async function pasteFromClipboard(ctx: { cwd: string; ui: { pasteToEditor(text: string): void; notify(message: string, type?: "info" | "warning" | "error"): void } }): Promise<void> {
+function isCtrlV(data: string): boolean {
+	return data === "\x16" || matchesKey(data, "ctrl+v");
+}
+
+function isPasteCommandShortcut(data: string): boolean {
+	// Some terminals surface menu/clipboard-history paste shortcuts as Alt+V rather
+	// than Ctrl+V. The Command key itself is usually handled by the terminal/OS and
+	// does not reach the TUI, but this catches terminals that forward the Alt part.
+	return matchesKey(data, "alt+v");
+}
+
+function getCompleteBracketedPasteContent(data: string): string | undefined {
+	const start = data.indexOf("\x1b[200~");
+	if (start === -1) return undefined;
+	const contentStart = start + "\x1b[200~".length;
+	const end = data.indexOf("\x1b[201~", contentStart);
+	if (end === -1) return undefined;
+	return data.slice(contentStart, end);
+}
+
+function isDeleteKey(data: string): boolean {
+	return matchesKey(data, "backspace") || matchesKey(data, "delete");
+}
+
+function attachedImagesLines(): string[] | undefined {
+	if (pendingImages.length === 0) return undefined;
+	return ["Attached images:", ...pendingImages.map((image) => `- ${image.placeholder}`)];
+}
+
+function updateAttachedImagesWidget(ctx: ClipboardPasteContext): void {
+	ctx.ui.setWidget("clipboard-image-paste-attached-images", attachedImagesLines(), { placement: "belowEditor" });
+}
+
+function removeTrailingImagePlaceholder(ctx: ClipboardPasteContext): boolean {
+	const text = ctx.ui.getEditorText();
+	const image = [...pendingImages]
+		.sort((a, b) => b.placeholder.length - a.placeholder.length)
+		.find((candidate) => text.endsWith(candidate.placeholder) || text.trimEnd().endsWith(candidate.placeholder));
+	if (!image) return false;
+
+	const trimmedLength = text.trimEnd().length;
+	const trailingWhitespace = text.slice(trimmedLength);
+	ctx.ui.setEditorText(text.slice(0, trimmedLength - image.placeholder.length) + trailingWhitespace);
+	pendingImages = pendingImages.filter((candidate) => candidate !== image);
+	updateAttachedImagesWidget(ctx);
+	return true;
+}
+
+async function pasteFromClipboard(ctx: ClipboardPasteContext): Promise<void> {
 	try {
 		const imageId = nextImageId++;
 		const dir = path.join(ctx.cwd, ".pi", "pasted-images");
@@ -149,7 +209,8 @@ async function pasteFromClipboard(ctx: { cwd: string; ui: { pasteToEditor(text: 
 		});
 
 		ctx.ui.pasteToEditor(placeholder);
-		ctx.ui.notify(`Inserted ${placeholder} from clipboard image.`, "info");
+		updateAttachedImagesWidget(ctx);
+		ctx.ui.notify(attachedImagesLines()?.join("\n") ?? "Attached images:", "info");
 	} catch (imageError) {
 		try {
 			const text = await readClipboardText();
@@ -157,7 +218,10 @@ async function pasteFromClipboard(ctx: { cwd: string; ui: { pasteToEditor(text: 
 				ctx.ui.pasteToEditor(text);
 				return;
 			}
-			ctx.ui.notify("Clipboard does not contain an image or text.", "warning");
+			ctx.ui.notify(
+				`Clipboard does not contain readable image or text. Image error: ${imageError instanceof Error ? imageError.message : String(imageError)}`,
+				"warning",
+			);
 		} catch (textError) {
 			ctx.ui.notify(
 				`Could not paste from clipboard. Image error: ${imageError instanceof Error ? imageError.message : String(imageError)}. Text error: ${textError instanceof Error ? textError.message : String(textError)}`,
@@ -169,15 +233,55 @@ async function pasteFromClipboard(ctx: { cwd: string; ui: { pasteToEditor(text: 
 
 export default function clipboardImagePaste(pi: ExtensionAPI) {
 	let unsubscribeTerminalInput: (() => void) | undefined;
+	let activeCtx: ClipboardPasteContext | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
+		activeCtx = ctx;
 		unsubscribeTerminalInput?.();
+		let bracketedPasteBuffer: string | undefined;
 		unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) => {
 			// Fully take over Ctrl+V at the raw terminal-input layer, avoiding Pi's built-in
 			// paste-image implementation and preserving text paste fallback ourselves.
-			if (data === "\x16") {
+			if (isCtrlV(data) || isPasteCommandShortcut(data)) {
 				void pasteFromClipboard(ctx);
 				return { consume: true };
+			}
+
+			if (isDeleteKey(data) && removeTrailingImagePlaceholder(ctx)) {
+				return { consume: true };
+			}
+
+			// Terminal/OS paste commands (including clipboard-history pickers such as
+			// Cmd+Alt+V on macOS) often arrive as bracketed paste rather than as Ctrl+V.
+			// Text pastes include content and should be left alone for Pi's editor. If the
+			// bracketed paste is empty, treat it as a possible image-only paste command and
+			// read the current OS clipboard image ourselves.
+			const completePaste = getCompleteBracketedPasteContent(data);
+			if (completePaste !== undefined) {
+				if (completePaste.length === 0) {
+					void pasteFromClipboard(ctx);
+					return { consume: true };
+				}
+				return undefined;
+			}
+
+			if (data.includes("\x1b[200~")) {
+				bracketedPasteBuffer = data.slice(data.indexOf("\x1b[200~") + "\x1b[200~".length);
+				return undefined;
+			}
+			if (bracketedPasteBuffer !== undefined) {
+				bracketedPasteBuffer += data;
+				const end = bracketedPasteBuffer.indexOf("\x1b[201~");
+				if (end !== -1) {
+					const pasteContent = bracketedPasteBuffer.slice(0, end);
+					bracketedPasteBuffer = undefined;
+					if (pasteContent.length === 0) {
+						void pasteFromClipboard(ctx);
+						// Do not consume the closing marker here: the editor already saw the
+						// opening marker in a previous chunk and needs the close to exit paste mode.
+						return undefined;
+					}
+				}
 			}
 			return undefined;
 		});
@@ -187,20 +291,13 @@ export default function clipboardImagePaste(pi: ExtensionAPI) {
 		if (pendingImages.length === 0) return { action: "continue" };
 
 		const text = event.text ?? "";
-		let imagesForThisPrompt = pendingImages.filter((image) => text.includes(image.placeholder));
+		const imagesForThisPrompt = pendingImages.filter((image) => text.includes(image.placeholder));
+		const transformedText = text;
 
-		// If the user pasted images but edited away the placeholders, still attach all pending images
-		// so Ctrl+V never silently drops an image.
-		let transformedText = text;
-		if (imagesForThisPrompt.length === 0) {
-			imagesForThisPrompt = [...pendingImages];
-			const missingPlaceholders = imagesForThisPrompt.map((image) => image.placeholder).join(" ");
-			transformedText = transformedText.trim()
-				? `${transformedText}\n\n${missingPlaceholders}`
-				: missingPlaceholders;
-		}
-
-		pendingImages = pendingImages.filter((image) => !imagesForThisPrompt.includes(image));
+		// If the user deleted an image placeholder, do not attach that image to the prompt.
+		pendingImages = pendingImages.filter((image) => !imagesForThisPrompt.includes(image) && text.includes(image.placeholder));
+		if (activeCtx) updateAttachedImagesWidget(activeCtx);
+		if (imagesForThisPrompt.length === 0) return { action: "continue" };
 
 		const imageList = imagesForThisPrompt
 			.map((image, index) => `${index + 1}. ${image.placeholder}: pasted from the OS clipboard and attached as an image object. Saved copy: ${image.path}`)
@@ -223,6 +320,8 @@ When answering, use the image content associated with each [Image n] marker. Do 
 	pi.on("session_shutdown", () => {
 		unsubscribeTerminalInput?.();
 		unsubscribeTerminalInput = undefined;
+		activeCtx?.ui.setWidget("clipboard-image-paste-attached-images", undefined, { placement: "belowEditor" });
+		activeCtx = undefined;
 		pendingImages = [];
 	});
 }
