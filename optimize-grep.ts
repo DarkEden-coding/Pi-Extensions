@@ -1,7 +1,7 @@
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const OPTIMIZED_TOOL_NAMES = new Set(["grep", "bash", "terminal", "shell"]);
+const OPTIMIZED_TOOL_NAMES = new Set(["grep", "find", "bash", "terminal", "shell"]);
 const MIN_MATCHES_FOR_GENERIC_TOOL = 5;
 const MIN_PATH_LINES_FOR_LIST = 5;
 
@@ -30,9 +30,12 @@ function isTextContentPart(part: unknown): part is TextContentPart {
 }
 
 function parseGrepLine(line: string): ParsedGrepLine | undefined {
+  const cleanLine = line.replace(/\r$/, "");
   // grep/rg/vimgrep style: path:line:content, path-line-content, and context lines.
   // Require a non-empty path and a numeric line so ordinary log/status lines are ignored.
-  const match = /^(.+?)([:-])(\d+)([:-])(.*)$/.exec(line);
+  // The non-greedy path still works for Windows drive paths because the separator must be
+  // followed by a line number (for example C:\\repo\\file.ts:12:content).
+  const match = /^(.+?)([:-])(\d+)([:-])(.*)$/.exec(cleanLine);
   if (!match) return undefined;
 
   const [, filePath, sep1, lineNumber, , text] = match;
@@ -46,16 +49,30 @@ function parseGrepLine(line: string): ParsedGrepLine | undefined {
   };
 }
 
+function getPathParts(inputPath: string): { dir: string; base: string } {
+  const expanded = inputPath.replace(/^~(?=$|[\\/])/, process.env.HOME ?? "~");
+  const parser = /^(?:[A-Za-z]:)?[\\/]/.test(expanded) || expanded.includes("\\") ? path.win32 : path.posix;
+  return {
+    dir: parser.dirname(expanded),
+    base: parser.basename(expanded),
+  };
+}
+
 function parsePathLine(line: string): ParsedPathLine | undefined {
   const trimmed = line.trim();
   if (!trimmed) return undefined;
   if (trimmed.startsWith("[") || trimmed.startsWith("...") || trimmed.startsWith("$ ")) return undefined;
-  if (/\s/.test(trimmed)) return undefined;
-  if (!/^([./~]|[A-Za-z]:[\\/])/.test(trimmed) && !trimmed.includes("/")) return undefined;
 
-  const normalized = trimmed.replace(/^~(?=$|[\\/])/, process.env.HOME ?? "~");
-  const dir = path.dirname(normalized);
-  const base = path.basename(normalized);
+  const startsLikePath = /^([./~]|[A-Za-z]:[\\/])/.test(trimmed);
+  const containsPathSeparator = trimmed.includes("/") || trimmed.includes("\\");
+  if (!startsLikePath && !containsPathSeparator) return undefined;
+
+  // Bare relative paths with whitespace are more likely to be prose/status output. Allow
+  // whitespace for explicit/absolute paths so `find` output such as `./dir/my file.ts` and
+  // Windows paths like `C:\\repo\\my file.ts` can still be grouped.
+  if (!startsLikePath && /\s/.test(trimmed)) return undefined;
+
+  const { dir, base } = getPathParts(trimmed);
   return { path: trimmed, dir, base };
 }
 
@@ -72,7 +89,7 @@ function shouldPreserveLine(line: string): boolean {
 }
 
 function optimizeGrepLikeOutput(text: string, options: { force: boolean }): string | undefined {
-  const lines = text.split("\n");
+  const lines = text.split(/\r?\n/);
   const parsedLines = lines.map(parseGrepLine);
   const matchCount = parsedLines.filter(Boolean).length;
 
@@ -111,7 +128,7 @@ function optimizeGrepLikeOutput(text: string, options: { force: boolean }): stri
 }
 
 function optimizePathListOutput(text: string): string | undefined {
-  const lines = text.split("\n");
+  const lines = text.split(/\r?\n/);
   const parsed = lines.map(parsePathLine).filter((line): line is ParsedPathLine => Boolean(line));
   if (parsed.length < MIN_PATH_LINES_FOR_LIST) return undefined;
 
