@@ -50,29 +50,43 @@ $img.Dispose()
 }
 
 async function readMacClipboardImage(outputPath: string): Promise<void> {
-	const tmpTiff = outputPath.replace(/\.png$/i, ".tiff");
+	// Prefer pngpaste when available. It is the most reliable way to read macOS clipboard
+	// images, including images selected from clipboard-history tools.
+	try {
+		await execFileAsync("pngpaste", [outputPath]);
+		return;
+	} catch {
+		// Fall through to the dependency-free AppKit/JXA implementation.
+	}
+
 	const jxa = `
 ObjC.import('AppKit');
 function main() {
+  const outputPath = ${JSON.stringify(outputPath)};
   const pb = $.NSPasteboard.generalPasteboard;
-  const png = pb.dataForType('public.png');
-  if (png) {
-    if (!png.writeToFileAtomically('${outputPath.replace(/'/g, "\\'")}', true)) throw new Error('Failed to write PNG');
-    return 'png';
+
+  const pngData = pb.dataForType('public.png');
+  if (pngData && pngData.length > 0) {
+    if (!pngData.writeToFileAtomically($(outputPath), true)) throw new Error('Failed to write PNG clipboard data');
+    return 'png-data';
   }
-  const tiff = pb.dataForType('public.tiff');
-  if (!tiff) throw new Error('Clipboard does not contain an image');
-  if (!tiff.writeToFileAtomically('${tmpTiff.replace(/'/g, "\\'")}', true)) throw new Error('Failed to write TIFF');
-  return 'tiff';
+
+  const image = $.NSImage.alloc.initWithPasteboard(pb);
+  if (!image || !image.isValid) throw new Error('Clipboard does not contain an image');
+
+  const tiffData = image.TIFFRepresentation;
+  if (!tiffData) throw new Error('Clipboard image has no TIFF representation');
+  const bitmap = $.NSBitmapImageRep.imageRepWithData(tiffData);
+  if (!bitmap) throw new Error('Could not create bitmap representation from clipboard image');
+  const png = bitmap.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));
+  if (!png) throw new Error('Could not encode clipboard image as PNG');
+  if (!png.writeToFileAtomically($(outputPath), true)) throw new Error('Failed to write encoded PNG');
+  return 'nsimage';
 }
 main();
 `;
 
-	const { stdout } = await execFileAsync("osascript", ["-l", "JavaScript", "-e", jxa]);
-	if (stdout.trim() === "tiff") {
-		await execFileAsync("sips", ["-s", "format", "png", tmpTiff, "--out", outputPath]);
-		await fs.rm(tmpTiff, { force: true });
-	}
+	await execFileAsync("osascript", ["-l", "JavaScript", "-e", jxa]);
 }
 
 async function readClipboardImage(outputPath: string): Promise<void> {
@@ -113,48 +127,60 @@ function imageBlock(image: PendingImage): ImageBlock {
 	};
 }
 
-export default function clipboardImagePaste(pi: ExtensionAPI) {
-	pi.registerShortcut("ctrl+v", {
-		description: "Paste from OS clipboard; images become [Image n] attachments",
-		handler: async (ctx) => {
-			try {
-				const imageId = nextImageId++;
-				const dir = path.join(ctx.cwd, ".pi", "pasted-images");
-				await fs.mkdir(dir, { recursive: true });
+async function pasteFromClipboard(ctx: { cwd: string; ui: { pasteToEditor(text: string): void; notify(message: string, type?: "info" | "warning" | "error"): void } }): Promise<void> {
+	try {
+		const imageId = nextImageId++;
+		const dir = path.join(ctx.cwd, ".pi", "pasted-images");
+		await fs.mkdir(dir, { recursive: true });
 
-				const fileName = `image-${new Date().toISOString().replace(/[:.]/g, "-")}-${imageId}.png`;
-				const outputPath = path.join(dir, fileName);
-				await readClipboardImage(outputPath);
+		const fileName = `image-${new Date().toISOString().replace(/[:.]/g, "-")}-${imageId}.png`;
+		const outputPath = path.join(dir, fileName);
+		await readClipboardImage(outputPath);
 
-				const data = await fs.readFile(outputPath, "base64");
-				const placeholder = `[Image ${imageId}]`;
-				pendingImages.push({
-					id: imageId,
-					placeholder,
-					path: outputPath,
-					mediaType: "image/png",
-					data,
-					insertedAt: Date.now(),
-				});
+		const data = await fs.readFile(outputPath, "base64");
+		const placeholder = `[Image ${imageId}]`;
+		pendingImages.push({
+			id: imageId,
+			placeholder,
+			path: outputPath,
+			mediaType: "image/png",
+			data,
+			insertedAt: Date.now(),
+		});
 
-				ctx.ui.pasteToEditor(placeholder);
-				ctx.ui.notify(`Inserted ${placeholder} from clipboard image.`, "info");
-			} catch (imageError) {
-				try {
-					const text = await readClipboardText();
-					if (text.length > 0) {
-						ctx.ui.pasteToEditor(text);
-						return;
-					}
-					ctx.ui.notify("Clipboard does not contain an image or text.", "warning");
-				} catch (textError) {
-					ctx.ui.notify(
-						`Could not paste from clipboard. Image error: ${imageError instanceof Error ? imageError.message : String(imageError)}. Text error: ${textError instanceof Error ? textError.message : String(textError)}`,
-						"error",
-					);
-				}
+		ctx.ui.pasteToEditor(placeholder);
+		ctx.ui.notify(`Inserted ${placeholder} from clipboard image.`, "info");
+	} catch (imageError) {
+		try {
+			const text = await readClipboardText();
+			if (text.length > 0) {
+				ctx.ui.pasteToEditor(text);
+				return;
 			}
-		},
+			ctx.ui.notify("Clipboard does not contain an image or text.", "warning");
+		} catch (textError) {
+			ctx.ui.notify(
+				`Could not paste from clipboard. Image error: ${imageError instanceof Error ? imageError.message : String(imageError)}. Text error: ${textError instanceof Error ? textError.message : String(textError)}`,
+				"error",
+			);
+		}
+	}
+}
+
+export default function clipboardImagePaste(pi: ExtensionAPI) {
+	let unsubscribeTerminalInput: (() => void) | undefined;
+
+	pi.on("session_start", (_event, ctx) => {
+		unsubscribeTerminalInput?.();
+		unsubscribeTerminalInput = ctx.ui.onTerminalInput((data) => {
+			// Fully take over Ctrl+V at the raw terminal-input layer, avoiding Pi's built-in
+			// paste-image implementation and preserving text paste fallback ourselves.
+			if (data === "\x16") {
+				void pasteFromClipboard(ctx);
+				return { consume: true };
+			}
+			return undefined;
+		});
 	});
 
 	pi.on("input", async (event) => {
@@ -195,6 +221,8 @@ When answering, use the image content associated with each [Image n] marker. Do 
 	});
 
 	pi.on("session_shutdown", () => {
+		unsubscribeTerminalInput?.();
+		unsubscribeTerminalInput = undefined;
 		pendingImages = [];
 	});
 }
