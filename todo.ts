@@ -16,6 +16,10 @@ type TodoTask = {
 	status: Status;
 };
 
+type CompletionRequest = {
+	id: string;
+};
+
 type TodoWeb = {
 	title: string;
 	tasks: TodoTask[];
@@ -26,6 +30,7 @@ type TodoState = {
 	approved: boolean;
 	lastAction?: string;
 	lastCompletedTaskId?: string;
+	lastCompletedTaskIds?: string[];
 	newlyUnblocked?: TodoTask[];
 	stillBlocked?: TodoTask[];
 	error?: string;
@@ -33,10 +38,15 @@ type TodoState = {
 
 const VALID_STATUSES = new Set<Status>(["pending", "in_progress", "completed"]);
 
+const CompletionParams = Type.Object({
+	id: Type.String({ description: "Task id being completed." }),
+});
+
 const TodoWebParams = Type.Object({
 	action: StringEnum(["set", "get", "complete", "clear", "approve"] as const),
 	web: Type.Optional(Type.Any({ description: "Full todo web JSON for action=set." })),
-	taskId: Type.Optional(Type.String({ description: "Task id for action=complete." })),
+	taskId: Type.Optional(Type.String({ description: "Task id for action=complete (single-task shorthand)." })),
+	completions: Type.Optional(Type.Array(CompletionParams, { description: "One or more completed task ids for action=complete. Use this for parallel task completions." })),
 });
 
 function cloneWeb(web?: TodoWeb): TodoWeb | undefined {
@@ -82,13 +92,18 @@ function validateAndNormalizeWeb(input: unknown): { web?: TodoWeb; errors: strin
 		if (id && ids.has(id)) errors.push(`duplicate task id: ${id}`);
 		if (id) ids.add(id);
 
+		const title = typeof t.title === "string" ? t.title.trim() : "";
+		if (!title) errors.push(`tasks[${i}].title must be a non-empty string`);
+		const description = typeof t.description === "string" ? t.description.trim() : "";
+		if (!description) errors.push(`tasks[${i}].description must be a non-empty string`);
+
 		const status = t.status as Status;
 		if (!VALID_STATUSES.has(status)) errors.push(`task ${id || i} has invalid status: ${String(t.status)}`);
 
 		tasks.push({
 			id,
-			title: typeof t.title === "string" && t.title.trim() ? t.title.trim() : id || `Task ${i + 1}`,
-			description: typeof t.description === "string" ? t.description : "",
+			title,
+			description,
 			acceptanceCriteria: normalizeStringArray(t.acceptanceCriteria, `task ${id || i}.acceptanceCriteria`, errors),
 			notes: normalizeStringArray(t.notes, `task ${id || i}.notes`, errors),
 			dependencies: normalizeStringArray(t.dependencies, `task ${id || i}.dependencies`, errors),
@@ -147,6 +162,45 @@ function formatWeb(web?: TodoWeb): string {
 		const blocked = t.status !== "completed" && !isUnblocked(t, web) ? " blocked" : "";
 		return `- [${t.status === "completed" ? "x" : " "}] ${t.id}: ${t.title} (${t.status}${blocked})${deps}\n  ${t.description}`;
 	})].join("\n");
+}
+
+function normalizeCompletionRequests(params: {
+	taskId?: string;
+	completions?: unknown;
+}): { completions: CompletionRequest[]; errors: string[] } {
+	const completions: CompletionRequest[] = [];
+	const errors: string[] = [];
+
+	if (params.taskId !== undefined) {
+		completions.push({
+			id: typeof params.taskId === "string" ? params.taskId.trim() : "",
+		});
+	}
+
+	if (params.completions !== undefined) {
+		if (!Array.isArray(params.completions)) errors.push("completions must be an array");
+		else for (let i = 0; i < params.completions.length; i++) {
+			const item = params.completions[i];
+			if (!item || typeof item !== "object" || Array.isArray(item)) {
+				errors.push(`completions[${i}] must be an object`);
+				continue;
+			}
+			const c = item as Record<string, unknown>;
+			completions.push({
+				id: typeof c.id === "string" ? c.id.trim() : "",
+			});
+		}
+	}
+
+	if (!completions.length) errors.push("action=complete requires either taskId or completions[].");
+	const seen = new Set<string>();
+	for (let i = 0; i < completions.length; i++) {
+		const c = completions[i];
+		if (!c.id) errors.push(`completion ${i + 1} is missing id/taskId`);
+		if (c.id && seen.has(c.id)) errors.push(`duplicate completion for task id: ${c.id}`);
+		if (c.id) seen.add(c.id);
+	}
+	return { completions, errors };
 }
 
 class TodoWebComponent {
@@ -240,11 +294,11 @@ export default function todoExtension(pi: ExtensionAPI): void {
 	}
 
 	function systemCreatePrompt(userPrompt?: string, refinement?: string): string {
-		return `Create or revise a dependency-aware todo web for the user's large task. Call todo_web with action=set and a full JSON web. Do not mark it approved.\n\nSchema:\n{\n  "title": "string",\n  "tasks": [{\n    "id": "stable-short-id",\n    "title": "string",\n    "description": "string",\n    "acceptanceCriteria": ["string"],\n    "notes": ["string"],\n    "dependencies": ["task-id"],\n    "status": "pending"\n  }]\n}\n\nRules: dependencies are task ids that must be completed before the task is unblocked; use only statuses pending/in_progress/completed; avoid cycles; make tasks small enough to complete one at a time.${userPrompt ? `\n\nUser prompt for this todo web:\n${userPrompt}` : ""}${refinement ? `\n\nUser refinement request:\n${refinement}` : ""}`;
+		return `Create or revise a dependency-aware todo web for the user's large task. Call todo_web with action=set and a full JSON web. Do not mark it approved.\n\nSchema:\n{\n  "title": "string",\n  "tasks": [{\n    "id": "stable-short-id",\n    "title": "string",\n    "description": "string",\n    "acceptanceCriteria": ["string"],\n    "notes": ["string"],\n    "dependencies": ["task-id"],\n    "status": "pending"\n  }]\n}\n\nRules: every task must have a non-empty title/name and description; dependencies are task ids that must be completed before the task is unblocked; use only statuses pending/in_progress/completed; avoid cycles; make tasks small enough to complete one at a time.${userPrompt ? `\n\nUser prompt for this todo web:\n${userPrompt}` : ""}${refinement ? `\n\nUser refinement request:\n${refinement}` : ""}`;
 	}
 
 	function runPrompt(): string {
-		return `Run the approved todo web. Choose exactly one currently unblocked non-completed task from the todo_web state, explain your choice briefly, complete that task, then call todo_web with action=complete and taskId only. After the tool returns, choose the next unblocked task yourself and continue one task at a time until all tasks are completed or no unblocked tasks remain.`;
+		return `Run the approved todo web. Choose currently unblocked non-completed task(s) from the todo_web state. You may execute independent unblocked tasks in parallel when safe. After completing task work, call todo_web with action=complete and either taskId for one task or completions: [{ id }] for multiple parallel completions. Continue until all tasks are completed or no unblocked tasks remain.`;
 	}
 
 	pi.on("session_start", async (_event, ctx) => reconstruct(ctx));
@@ -276,11 +330,12 @@ export default function todoExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "todo_web",
 		label: "Todo Web",
-		description: "Create, inspect, approve, clear, or complete tasks in a branch-aware dependency todo web.",
+		description: "Create, inspect, approve, clear, or complete one or more tasks in a branch-aware dependency todo web. Created tasks require names/titles and descriptions; completion supports parallel task batches by id.",
 		promptSnippet: "Manage the branch-local dependency todo web for large tasks.",
 		promptGuidelines: [
 			"Use todo_web action=set to create or revise the full todo web before executing large tasks.",
-			"Use todo_web action=complete with only taskId immediately after completing exactly one unblocked task.",
+			"Use todo_web action=complete immediately after completing unblocked task work.",
+			"Use todo_web action=complete with completions: [{ id }] to record multiple independent unblocked tasks completed in parallel.",
 		],
 		parameters: TodoWebParams,
 		async execute(_id, params) {
@@ -306,18 +361,40 @@ export default function todoExtension(pi: ExtensionAPI): void {
 			}
 			if (params.action === "complete") {
 				if (!state.web) return { content: [{ type: "text", text: "No todo web exists." }], details: { ...state, error: "no web", lastAction: "complete" } satisfies TodoState };
-				if (!params.taskId) return { content: [{ type: "text", text: "taskId is required for complete." }], details: { ...state, error: "taskId required", lastAction: "complete" } satisfies TodoState };
+				const normalized = normalizeCompletionRequests(params);
+				if (normalized.errors.length) {
+					const error = `Invalid completion request:\n${normalized.errors.map((e) => `- ${e}`).join("\n")}`;
+					return { content: [{ type: "text", text: error }], details: { ...state, error, lastAction: "complete" } satisfies TodoState };
+				}
+
 				const beforeUnblocked = new Set(unblockedTasks(state.web).map((t) => t.id));
-				const task = state.web.tasks.find((t) => t.id === params.taskId);
-				if (!task) return { content: [{ type: "text", text: `Task ${params.taskId} not found.` }], details: { ...state, error: "task not found", lastAction: "complete" } satisfies TodoState };
-				if (!isUnblocked(task, state.web) && task.status !== "completed") return { content: [{ type: "text", text: `Task ${task.id} is still blocked by incomplete dependencies: ${task.dependencies.join(", ")}` }], details: { ...state, error: "task blocked", lastAction: "complete" } satisfies TodoState };
-				task.status = "completed";
+				const tasksToComplete: Array<{ task: TodoTask; completion: CompletionRequest }> = [];
+				const validationErrors: string[] = [];
+				for (const completion of normalized.completions) {
+					const task = state.web.tasks.find((t) => t.id === completion.id);
+					if (!task) {
+						validationErrors.push(`Task ${completion.id} not found.`);
+						continue;
+					}
+					if (task.status !== "completed" && !beforeUnblocked.has(task.id)) validationErrors.push(`Task ${task.id} is still blocked by incomplete dependencies: ${task.dependencies.join(", ")}`);
+					tasksToComplete.push({ task, completion });
+				}
+				if (validationErrors.length) {
+					const error = `Could not complete task batch:\n${validationErrors.map((e) => `- ${e}`).join("\n")}`;
+					return { content: [{ type: "text", text: error }], details: { ...state, error, lastAction: "complete" } satisfies TodoState };
+				}
+
+				for (const { task } of tasksToComplete) {
+					task.status = "completed";
+				}
+				const completedIds = tasksToComplete.map(({ task }) => task.id);
 				const nowUnblocked = unblockedTasks(state.web);
 				const newlyUnblocked = nowUnblocked.filter((t) => !beforeUnblocked.has(t.id));
 				const stillBlocked = blockedTasks(state.web);
-				state = { ...state, lastAction: "complete", lastCompletedTaskId: task.id, newlyUnblocked, stillBlocked, error: undefined };
+				state = { ...state, lastAction: "complete", lastCompletedTaskId: completedIds[completedIds.length - 1], lastCompletedTaskIds: completedIds, newlyUnblocked, stillBlocked, error: undefined };
 				const remaining = nowUnblocked.filter((t) => t.status !== "completed");
-				const text = `Completed ${task.id}: ${task.title}\n\nNewly unblocked:\n${newlyUnblocked.length ? newlyUnblocked.map((t) => `- ${t.id}: ${t.title}`).join("\n") : "- none"}\n\nStill blocked:\n${stillBlocked.length ? stillBlocked.map((t) => `- ${t.id}: ${t.title} (deps: ${t.dependencies.join(", ")})`).join("\n") : "- none"}\n\nFull todo web:\n${formatWeb(state.web)}\n\nNext: choose one currently unblocked non-completed task yourself and execute exactly that one task, then call todo_web action=complete again. ${remaining.length ? `Currently unblocked: ${remaining.map((t) => `${t.id}: ${t.title}`).join("; ")}` : "No unblocked pending tasks remain."}`;
+				const completedText = tasksToComplete.map(({ task }) => `- ${task.id}: ${task.title}`).join("\n");
+				const text = `Completed ${completedIds.length} task${completedIds.length === 1 ? "" : "s"}:\n${completedText}\n\nNewly unblocked:\n${newlyUnblocked.length ? newlyUnblocked.map((t) => `- ${t.id}: ${t.title}`).join("\n") : "- none"}\n\nStill blocked:\n${stillBlocked.length ? stillBlocked.map((t) => `- ${t.id}: ${t.title} (deps: ${t.dependencies.join(", ")})`).join("\n") : "- none"}\n\nFull todo web:\n${formatWeb(state.web)}\n\nNext: choose currently unblocked non-completed task(s) yourself. You may run independent unblocked tasks in parallel. Then call todo_web action=complete for every completed task. ${remaining.length ? `Currently unblocked: ${remaining.map((t) => `${t.id}: ${t.title}`).join("; ")}` : "No unblocked pending tasks remain."}`;
 				return { content: [{ type: "text", text }], details: { ...state } satisfies TodoState };
 			}
 			return { content: [{ type: "text", text: `Unknown action ${params.action}` }], details: { ...state, error: "unknown action" } satisfies TodoState };
@@ -325,6 +402,7 @@ export default function todoExtension(pi: ExtensionAPI): void {
 		renderCall(args, theme) {
 			let s = theme.fg("toolTitle", theme.bold("todo_web ")) + theme.fg("muted", args.action);
 			if (args.taskId) s += " " + theme.fg("accent", args.taskId);
+			if (Array.isArray(args.completions) && args.completions.length) s += " " + theme.fg("accent", args.completions.map((c: { id?: string }) => c.id).filter(Boolean).join(", "));
 			return new Text(s, 0, 0);
 		},
 		renderResult(result, _options, theme) {
