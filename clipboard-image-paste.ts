@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -119,6 +119,26 @@ async function readClipboardText(): Promise<string> {
 	throw new Error("Clipboard text paste fallback is currently implemented for Windows and macOS only.");
 }
 
+function windowsClipboardHasPlainTextOnly(): boolean {
+	try {
+		execFileSync(
+			"powershell.exe",
+			[
+				"-NoProfile",
+				"-STA",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-Command",
+				"Add-Type -AssemblyName System.Windows.Forms; if ([System.Windows.Forms.Clipboard]::ContainsText() -and -not [System.Windows.Forms.Clipboard]::ContainsImage()) { exit 0 } else { exit 1 }",
+			],
+			{ stdio: "ignore", timeout: 1000 },
+		);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function imageBlock(image: PendingImage): ImageBlock {
 	return {
 		type: "image",
@@ -176,6 +196,9 @@ export default function clipboardImagePaste(pi: ExtensionAPI) {
 			// Fully take over Ctrl+V at the raw terminal-input layer, avoiding Pi's built-in
 			// paste-image implementation and preserving text paste fallback ourselves.
 			if (data === "\x16") {
+				if (process.platform === "win32" && windowsClipboardHasPlainTextOnly()) {
+					return undefined;
+				}
 				void pasteFromClipboard(ctx);
 				return { consume: true };
 			}
