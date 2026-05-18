@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Editor, type EditorTheme, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 
 const questionSchema = Type.Object({
@@ -46,44 +47,152 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const answers: Answer[] = [];
+			const result = await ctx.ui.custom<{ answers: Answer[]; cancelled: boolean }>((tui, theme, _kb, done) => {
+				let questionIndex = 0;
+				let optionIndex = 0;
+				let inputMode = false;
+				let cachedLines: string[] | undefined;
+				const answers: (Answer | undefined)[] = [];
 
-			for (let i = 0; i < params.questions.length; i++) {
-				const item = params.questions[i]!;
-				const choices = [...item.options, "Custom response…"];
-				const title = params.questions.length === 1
-					? item.question
-					: `Question ${i + 1}/${params.questions.length}: ${item.question}`;
+				const editorTheme: EditorTheme = {
+					borderColor: (s) => theme.fg("accent", s),
+					selectList: {
+						selectedPrefix: (t) => theme.fg("accent", t),
+						selectedText: (t) => theme.fg("accent", t),
+						description: (t) => theme.fg("muted", t),
+						scrollInfo: (t) => theme.fg("dim", t),
+						noMatch: (t) => theme.fg("warning", t),
+					},
+				};
+				const editor = new Editor(tui, editorTheme);
 
-				const choice = await ctx.ui.select(title, choices);
-				if (choice === undefined) {
-					return {
-						isError: true,
-						content: [{ type: "text", text: "User cancelled the question dialog." }],
-						details: { answers, cancelled: true },
-					};
+				function refresh() {
+					cachedLines = undefined;
+					tui.requestRender();
 				}
 
-				if (choice === "Custom response…") {
-					const custom = await ctx.ui.input(`Custom response for: ${item.question}`, "Type your answer");
-					if (custom === undefined) {
-						return {
-							isError: true,
-							content: [{ type: "text", text: "User cancelled the custom response dialog." }],
-							details: { answers, cancelled: true },
-						};
+				function submit(cancelled: boolean) {
+					done({ answers: answers.filter((answer): answer is Answer => answer !== undefined), cancelled });
+				}
+
+				function selectedAnswerIndex() {
+					const answer = answers[questionIndex];
+					if (!answer) return 0;
+					return answer.type === "custom" ? params.questions[questionIndex]!.options.length : (answer.optionIndex ?? 0);
+				}
+
+				function moveToQuestion(nextIndex: number) {
+					questionIndex = Math.max(0, Math.min(params.questions.length - 1, nextIndex));
+					optionIndex = selectedAnswerIndex();
+					inputMode = false;
+					editor.setText(answers[questionIndex]?.type === "custom" ? answers[questionIndex]!.answer : "");
+					refresh();
+				}
+
+				function saveAnswer(answer: Answer) {
+					answers[questionIndex] = answer;
+				}
+
+				editor.onSubmit = (value) => {
+					const item = params.questions[questionIndex]!;
+					const custom = value.trim() || "(no response)";
+					saveAnswer({ question: item.question, answer: custom, type: "custom" });
+					inputMode = false;
+					if (questionIndex === params.questions.length - 1) submit(false);
+					else moveToQuestion(questionIndex + 1);
+				};
+
+				function handleInput(data: string) {
+					if (inputMode) {
+						if (matchesKey(data, Key.escape)) {
+							inputMode = false;
+							refresh();
+							return;
+						}
+						editor.handleInput(data);
+						refresh();
+						return;
 					}
-					answers.push({ question: item.question, answer: custom, type: "custom" });
-				} else {
-					answers.push({
-						question: item.question,
-						answer: choice,
-						type: "option",
-						optionIndex: item.options.indexOf(choice),
-					});
+
+					const item = params.questions[questionIndex]!;
+					const choices = [...item.options, "Custom response…"];
+
+					if (matchesKey(data, Key.left)) {
+						moveToQuestion(questionIndex - 1);
+						return;
+					}
+					if (matchesKey(data, Key.right)) {
+						moveToQuestion(questionIndex + 1);
+						return;
+					}
+					if (matchesKey(data, Key.up)) {
+						optionIndex = Math.max(0, optionIndex - 1);
+						refresh();
+						return;
+					}
+					if (matchesKey(data, Key.down)) {
+						optionIndex = Math.min(choices.length - 1, optionIndex + 1);
+						refresh();
+						return;
+					}
+					if (matchesKey(data, Key.escape)) {
+						submit(true);
+						return;
+					}
+					if (matchesKey(data, Key.enter)) {
+						const choice = choices[optionIndex]!;
+						if (optionIndex === item.options.length) {
+							inputMode = true;
+							editor.setText(answers[questionIndex]?.type === "custom" ? answers[questionIndex]!.answer : "");
+							refresh();
+							return;
+						}
+						saveAnswer({ question: item.question, answer: choice, type: "option", optionIndex });
+						if (questionIndex === params.questions.length - 1) submit(false);
+						else moveToQuestion(questionIndex + 1);
+					}
 				}
+
+				function render(width: number): string[] {
+					if (cachedLines) return cachedLines;
+					const item = params.questions[questionIndex]!;
+					const choices = [...item.options, "Custom response…"];
+					const lines: string[] = [];
+					const add = (s: string) => lines.push(truncateToWidth(s, width));
+					add(theme.fg("accent", "─".repeat(width)));
+					add(theme.fg("text", ` Question ${questionIndex + 1}/${params.questions.length}: ${item.question}`));
+					lines.push("");
+					choices.forEach((choice, i) => {
+						const selected = i === optionIndex;
+						const current = answers[questionIndex]?.type === "custom" ? i === item.options.length : answers[questionIndex]?.optionIndex === i;
+						const prefix = selected ? theme.fg("accent", "> ") : "  ";
+						const suffix = current ? theme.fg("success", " ✓") : "";
+						add(prefix + theme.fg(selected ? "accent" : "text", `${i + 1}. ${choice}`) + suffix);
+					});
+					if (inputMode) {
+						lines.push("");
+						add(theme.fg("muted", " Custom answer:"));
+						for (const line of editor.render(width - 2)) add(` ${line}`);
+					}
+					lines.push("");
+					add(theme.fg("dim", " ←→ previous/next question • ↑↓ select • Enter answer/submit last • Esc cancel"));
+					add(theme.fg("accent", "─".repeat(width)));
+					cachedLines = lines;
+					return lines;
+				}
+
+				return { render, invalidate: () => { cachedLines = undefined; }, handleInput };
+			});
+
+			if (result.cancelled) {
+				return {
+					isError: true,
+					content: [{ type: "text", text: "User cancelled the question dialog." }],
+					details: { answers: result.answers, cancelled: true },
+				};
 			}
 
+			const answers = result.answers;
 			const text = answers
 				.map((answer, i) => `${i + 1}. ${answer.question}\nAnswer: ${answer.answer}${answer.type === "custom" ? " (custom)" : ""}`)
 				.join("\n\n");

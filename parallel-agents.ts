@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
@@ -31,6 +31,7 @@ interface ParallelAgentsConfig {
 }
 
 const CONFIG_PATH = join(getAgentDir(), "parallel-agents.json");
+const DEBUG_LOG_PATH = join(getAgentDir(), "parallel-agents-debug.log");
 const DEFAULT_CONFIG: ParallelAgentsConfig = {
 	maxParallelAgents: 4,
 	allowedExtensionTools: [],
@@ -136,12 +137,29 @@ function taskTools(mode: TaskMode, allowedExtensionTools: string[]): string[] {
 	return [...new Set([...builtins, ...allowedExtensionTools])];
 }
 
-function buildSubAgentPrompt(task: SubAgentTask): string {
+function isKimiProfile(profile: ModelProfile): boolean {
+	return `${profile.provider}/${profile.model}`.toLowerCase().includes("kimi");
+}
+
+function debugLog(message: string, details?: unknown) {
+	try {
+		ensureConfigDir();
+		const suffix = details === undefined ? "" : ` ${JSON.stringify(details, (_key, value) => value instanceof Set ? [...value] : value)}`;
+		appendFileSync(DEBUG_LOG_PATH, `[${new Date().toISOString()}] ${message}${suffix}\n`, "utf-8");
+	} catch {
+		// Debug logging must never break agent execution.
+	}
+}
+
+function buildSubAgentPrompt(task: SubAgentTask, profile: ModelProfile): string {
+	const kimiEditRules = isKimiProfile(profile) && task.mode === "editing"
+		? `\n\nKimi/tool-use compatibility rules:\n- The edit tool requires this exact shape: {"path":"relative/or/absolute/path","edits":[{"oldText":"exact unique text copied from the current file","newText":"replacement text"}]}. Do not send oldText/newText at the top level.\n- Always read the target file immediately before an edit and copy oldText verbatim from that read result.\n- If an edit fails once because oldText is not unique or not found, re-read the file and either make a smaller exact edit or use bash with a short python script to rewrite the file deterministically.\n- For risky rewrites, first create an easily reverted backup outside the repo at /tmp/pi-parallel-agent-backups/<timestamp>-<basename>.bak, then report the backup path in your final answer.\n- Do not repeatedly retry the same failing edit arguments.`
+		: "";
 	const modeRules =
 		task.mode === "editing"
 			? "You may edit files and run shell commands. Keep edits focused. If multiple agents are running, touch only files assigned in this prompt."
 			: "You are in read-only mode. Do not modify files or run shell commands. Only inspect and reason.";
-	return `You are a pi sub-agent running as part of a parallel multi-agent task.\n\nRules:\n- Complete only the task below.\n- ${modeRules}\n- Do not ask the user questions. If information is missing, state assumptions in the final answer.\n- Avoid interactive commands and tools.\n- Final answer should be concise and directly useful to the main agent.\n\nTask:\n${task.prompt}`;
+	return `You are a pi sub-agent running as part of a parallel multi-agent task.\n\nRules:\n- Complete only the task below.\n- ${modeRules}\n- Do not ask the user questions. If information is missing, state assumptions in the final answer.\n- Avoid interactive commands and tools.\n- Final answer should be concise and directly useful to the main agent.${kimiEditRules}\n\nTask:\n${task.prompt}`;
 }
 
 function getFinalAssistantText(session: any): string {
@@ -206,23 +224,33 @@ async function runSubAgent(
 		tools: taskTools(task.mode as TaskMode, config.allowedExtensionTools),
 	});
 
+	debugLog("sub-agent-start", { name: task.name, profile, mode: task.mode });
 	const unsubscribe = session.subscribe((event: any) => {
-		if (event.type !== "tool_execution_start") return;
-		stats.actions++;
-		const args = event.args ?? {};
-		if (event.toolName === "read" && typeof args.path === "string") stats.filesRead.add(args.path);
-		if ((event.toolName === "edit" || event.toolName === "write") && typeof args.path === "string") stats.filesEdited.add(args.path);
-		onStatsChange();
+		if (event.type === "tool_execution_start") {
+			stats.actions++;
+			const args = event.args ?? {};
+			if (event.toolName === "read" && typeof args.path === "string") stats.filesRead.add(args.path);
+			if ((event.toolName === "edit" || event.toolName === "write") && typeof args.path === "string") stats.filesEdited.add(args.path);
+			debugLog("tool-start", { agent: task.name ?? profile.name, tool: event.toolName, args });
+			onStatsChange();
+			return;
+		}
+		if (event.type === "tool_execution_end") {
+			debugLog("tool-end", { agent: task.name ?? profile.name, tool: event.toolName, isError: event.isError, result: event.result });
+		}
 	});
 
 	try {
-		await session.prompt(buildSubAgentPrompt(task), { source: "extension" as any });
+		await session.prompt(buildSubAgentPrompt(task, profile), { source: "extension" as any });
 		stats.status = "done";
 		onStatsChange();
-		return { ok: true, name: task.name ?? profile.name, output: getFinalAssistantText(session) };
+		const output = getFinalAssistantText(session);
+		debugLog("sub-agent-done", { name: task.name ?? profile.name, filesRead: stats.filesRead, filesEdited: stats.filesEdited, output });
+		return { ok: true, name: task.name ?? profile.name, output };
 	} catch (error) {
 		stats.status = "failed";
 		onStatsChange();
+		debugLog("sub-agent-failed", { name: task.name ?? profile.name, error: error instanceof Error ? error.stack ?? error.message : String(error) });
 		throw error;
 	} finally {
 		unsubscribe();

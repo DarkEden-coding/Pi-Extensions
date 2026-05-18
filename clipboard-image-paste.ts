@@ -2,10 +2,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const piExtensionsDir = path.join(os.homedir(), ".pi", "agent", "extensions");
 
 type ImageBlock = {
 	type: "image";
@@ -190,7 +192,7 @@ function removeTrailingImagePlaceholder(ctx: ClipboardPasteContext): boolean {
 async function pasteFromClipboard(ctx: ClipboardPasteContext): Promise<void> {
 	try {
 		const imageId = nextImageId++;
-		const dir = path.join(ctx.cwd, ".pi", "pasted-images");
+		const dir = path.join(piExtensionsDir, ".pi", "pasted-images");
 		await fs.mkdir(dir, { recursive: true });
 
 		const fileName = `image-${new Date().toISOString().replace(/[:.]/g, "-")}-${imageId}.png`;
