@@ -4,9 +4,14 @@ import fs from "fs";
 import path from "path";
 
 const KEYS_FILE = path.join(process.env.HOME || process.env.USERPROFILE || "", ".pi", "agent", "api-keys.json");
-const USER_OUTPUT_MAX_LINES = 4;
+const COLLAPSED_OUTPUT_MAX_LINES = 4;
+const EXPANDED_OUTPUT_MAX_LINES = 24;
 
-type ToolResult = { content?: Array<{ type: string; text?: string }> };
+type ToolResult = {
+	content?: Array<{ type: string; text?: string }>;
+	details?: any;
+	error?: unknown;
+};
 
 export function loadKeys(): Record<string, string> {
 	try {
@@ -40,14 +45,29 @@ function firstText(result: ToolResult): string {
 	return result.content?.find((content) => content.type === "text")?.text ?? "";
 }
 
-export function renderTruncatedToolResult(result: ToolResult, { expanded }: { expanded: boolean }, theme: any): Text | undefined {
-	if (!expanded) return undefined;
+function errorText(result: ToolResult): string {
+	const error = result.error ?? result.details?.error;
+	if (!error) return "";
+	if (error instanceof Error) return error.message;
+	if (typeof error === "string") return error;
+	try {
+		return JSON.stringify(error, null, 2);
+	} catch {
+		return String(error);
+	}
+}
 
-	const text = firstText(result).trim();
-	if (!text) return undefined;
+export function renderTruncatedToolResult(
+	result: ToolResult,
+	{ expanded, isError }: { expanded: boolean; isError?: boolean },
+	theme: any,
+): Text {
+	const error = errorText(result).trim();
+	const text = (error || firstText(result)).trim();
+	if (!text) return new Text("", 0, 0);
 
 	const truncation = truncateHead(text, {
-		maxLines: USER_OUTPUT_MAX_LINES,
+		maxLines: expanded ? EXPANDED_OUTPUT_MAX_LINES : COLLAPSED_OUTPUT_MAX_LINES,
 		maxBytes: DEFAULT_MAX_BYTES,
 	});
 
@@ -56,5 +76,6 @@ export function renderTruncatedToolResult(result: ToolResult, { expanded }: { ex
 		output += `\n[Output truncated for display: ${truncation.outputLines} of ${truncation.totalLines} lines.]`;
 	}
 
-	return new Text(`\n${theme.fg("toolOutput", output)}`, 0, 0);
+	const color = error || isError ? "error" : "toolOutput";
+	return new Text(`\n${theme.fg(color, output)}`, 0, 0);
 }

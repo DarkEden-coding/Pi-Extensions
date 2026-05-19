@@ -31,8 +31,10 @@ export default function (pi: ExtensionAPI) {
       queries: Type.Array(Type.String({ description: "Queries to find the most relevant documentation snippets" })),
     }),
     renderCall(args, theme, context) {
-      if (!context.expanded) return undefined;
-      return new Text(`${theme.fg("toolTitle", theme.bold("context7 search"))} ${theme.fg("accent", args.libraryName)} ${theme.fg("dim", args.queries.join(", "))}`, 0, 0);
+      const title = theme.fg("toolTitle", theme.bold("context7 search"));
+      const queries = Array.isArray(args.queries) ? args.queries.join(", ") : "";
+      if (!context.expanded) return new Text(title, 0, 0);
+      return new Text(`${title} ${theme.fg("accent", args.libraryName ?? "")} ${theme.fg("dim", queries)}`, 0, 0);
     },
     renderResult: renderTruncatedToolResult,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -96,8 +98,10 @@ export default function (pi: ExtensionAPI) {
       type: Type.Optional(Type.String({ description: "Format: json or markdown" })),
     }),
     renderCall(args, theme, context) {
-      if (!context.expanded) return undefined;
-      return new Text(`${theme.fg("toolTitle", theme.bold("context7 context"))} ${theme.fg("accent", args.libraryId)} ${theme.fg("dim", args.queries.join(", "))}`, 0, 0);
+      const title = theme.fg("toolTitle", theme.bold("context7 context"));
+      const queries = Array.isArray(args.queries) ? args.queries.join(", ") : "";
+      if (!context.expanded) return new Text(title, 0, 0);
+      return new Text(`${title} ${theme.fg("accent", args.libraryId ?? "")} ${theme.fg("dim", queries)}`, 0, 0);
     },
     renderResult: renderTruncatedToolResult,
     async execute(toolCallId, params, signal, onUpdate, ctx) {

@@ -38,8 +38,10 @@ export default function braveSearch(pi: ExtensionAPI) {
     }),
     
     renderCall(args, theme, context) {
-      if (!context.expanded) return undefined;
-      return new Text(`${theme.fg("toolTitle", theme.bold("brave"))} ${theme.fg("accent", args.queries.join(", "))}`, 0, 0);
+      const queries = Array.isArray(args.queries) ? args.queries.join(", ") : "";
+      const title = theme.fg("toolTitle", theme.bold("brave"));
+      if (!context.expanded) return new Text(title, 0, 0);
+      return new Text(`${title} ${theme.fg("accent", queries)}`, 0, 0);
     },
     renderResult: renderTruncatedToolResult,
     async execute(_toolCallId, params, signal, onUpdate, _ctx) {

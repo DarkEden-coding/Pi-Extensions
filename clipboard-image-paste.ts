@@ -1,13 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const piExtensionsDir = path.join(os.homedir(), ".pi", "agent", "extensions");
 
 type ImageBlock = {
 	type: "image";
@@ -18,7 +14,6 @@ type ImageBlock = {
 type PendingImage = {
 	id: number;
 	placeholder: string;
-	path: string;
 	mediaType: string;
 	data: string;
 	insertedAt: number;
@@ -38,22 +33,23 @@ type ClipboardPasteContext = {
 	};
 };
 
-function quotePowerShellSingle(value: string): string {
-	return `'${value.replace(/'/g, "''")}'`;
-}
-
-async function readWindowsClipboardImage(outputPath: string): Promise<void> {
+async function readWindowsClipboardImage(): Promise<string> {
 	const script = `
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $img = [System.Windows.Forms.Clipboard]::GetImage()
 if ($null -eq $img) { Write-Error "Clipboard does not contain an image"; exit 2 }
-$path = ${quotePowerShellSingle(outputPath)}
-$img.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
-$img.Dispose()
+$stream = New-Object System.IO.MemoryStream
+try {
+  $img.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+  [Convert]::ToBase64String($stream.ToArray())
+} finally {
+  $stream.Dispose()
+  $img.Dispose()
+}
 `;
 
-	await execFileAsync("powershell.exe", [
+	const { stdout } = await execFileAsync("powershell.exe", [
 		"-NoProfile",
 		"-STA",
 		"-ExecutionPolicy",
@@ -61,29 +57,21 @@ $img.Dispose()
 		"-Command",
 		script,
 	]);
+	return stdout.trim();
 }
 
-async function readMacClipboardImage(outputPath: string): Promise<void> {
-	// Prefer pngpaste when available. It is the most reliable way to read macOS clipboard
-	// images, including images selected from clipboard-history tools.
-	try {
-		await execFileAsync("pngpaste", [outputPath]);
-		return;
-	} catch {
-		// Fall through to the dependency-free AppKit/JXA implementation.
-	}
-
+async function readMacClipboardImage(): Promise<string> {
 	const jxa = `
 ObjC.import('AppKit');
+ObjC.import('Foundation');
+function base64(data) {
+  return ObjC.unwrap(data.base64EncodedStringWithOptions(0));
+}
 function main() {
-  const outputPath = ${JSON.stringify(outputPath)};
   const pb = $.NSPasteboard.generalPasteboard;
 
   const pngData = pb.dataForType('public.png');
-  if (pngData && pngData.length > 0) {
-    if (!pngData.writeToFileAtomically($(outputPath), true)) throw new Error('Failed to write PNG clipboard data');
-    return 'png-data';
-  }
+  if (pngData && pngData.length > 0) return base64(pngData);
 
   const image = $.NSImage.alloc.initWithPasteboard(pb);
   if (!image || !image.isValid) throw new Error('Clipboard does not contain an image');
@@ -94,23 +82,21 @@ function main() {
   if (!bitmap) throw new Error('Could not create bitmap representation from clipboard image');
   const png = bitmap.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));
   if (!png) throw new Error('Could not encode clipboard image as PNG');
-  if (!png.writeToFileAtomically($(outputPath), true)) throw new Error('Failed to write encoded PNG');
-  return 'nsimage';
+  return base64(png);
 }
 main();
 `;
 
-	await execFileAsync("osascript", ["-l", "JavaScript", "-e", jxa]);
+	const { stdout } = await execFileAsync("osascript", ["-l", "JavaScript", "-e", jxa]);
+	return stdout.trim();
 }
 
-async function readClipboardImage(outputPath: string): Promise<void> {
+async function readClipboardImage(): Promise<string> {
 	if (process.platform === "win32") {
-		await readWindowsClipboardImage(outputPath);
-		return;
+		return readWindowsClipboardImage();
 	}
 	if (process.platform === "darwin") {
-		await readMacClipboardImage(outputPath);
-		return;
+		return readMacClipboardImage();
 	}
 	throw new Error("Clipboard image paste is currently implemented for Windows and macOS only.");
 }
@@ -192,19 +178,11 @@ function removeTrailingImagePlaceholder(ctx: ClipboardPasteContext): boolean {
 async function pasteFromClipboard(ctx: ClipboardPasteContext): Promise<void> {
 	try {
 		const imageId = nextImageId++;
-		const dir = path.join(piExtensionsDir, ".pi", "pasted-images");
-		await fs.mkdir(dir, { recursive: true });
-
-		const fileName = `image-${new Date().toISOString().replace(/[:.]/g, "-")}-${imageId}.png`;
-		const outputPath = path.join(dir, fileName);
-		await readClipboardImage(outputPath);
-
-		const data = await fs.readFile(outputPath, "base64");
+		const data = await readClipboardImage();
 		const placeholder = `[Image ${imageId}]`;
 		pendingImages.push({
 			id: imageId,
 			placeholder,
-			path: outputPath,
 			mediaType: "image/png",
 			data,
 			insertedAt: Date.now(),
@@ -289,33 +267,33 @@ export default function clipboardImagePaste(pi: ExtensionAPI) {
 		});
 	});
 
-	pi.on("input", async (event) => {
-		if (pendingImages.length === 0) return { action: "continue" };
+	pi.on("input", async () => {
+		return { action: "continue" };
+	});
 
-		const text = event.text ?? "";
+	pi.on("before_agent_start", async (event) => {
+		if (pendingImages.length === 0) return;
+
+		const text = event.prompt ?? "";
 		const imagesForThisPrompt = pendingImages.filter((image) => text.includes(image.placeholder));
-		const transformedText = text;
 
 		// If the user deleted an image placeholder, do not attach that image to the prompt.
 		pendingImages = pendingImages.filter((image) => !imagesForThisPrompt.includes(image) && text.includes(image.placeholder));
 		if (activeCtx) updateAttachedImagesWidget(activeCtx);
-		if (imagesForThisPrompt.length === 0) return { action: "continue" };
-
-		const imageList = imagesForThisPrompt
-			.map((image, index) => `${index + 1}. ${image.placeholder}: pasted from the OS clipboard and attached as an image object. Saved copy: ${image.path}`)
-			.join("\n");
-
-		const instruction = `
-
-System note from clipboard-image-paste extension:
-The user pasted ${imagesForThisPrompt.length === 1 ? "this image" : "these images"} into the prompt at the shown inline placeholder${imagesForThisPrompt.length === 1 ? "" : "s"}. Treat each placeholder as referring to the corresponding attached image object:
-${imageList}
-When answering, use the image content associated with each [Image n] marker. Do not say you cannot see the image unless the active model/provider actually cannot accept image inputs.`;
+		if (imagesForThisPrompt.length === 0) return;
 
 		return {
-			action: "transform",
-			text: transformedText + instruction,
-			images: [...(event.images ?? []), ...imagesForThisPrompt.map(imageBlock)],
+			message: {
+				customType: "clipboard-image-paste",
+				display: false,
+				content: [
+					{
+						type: "text" as const,
+						text: imagesForThisPrompt.map((image) => `${image.placeholder}: attached clipboard image.`).join("\n"),
+					},
+					...imagesForThisPrompt.map(imageBlock),
+				],
+			},
 		};
 	});
 
