@@ -5,7 +5,7 @@ import { getApiKey, loadKeys, renderTruncatedToolResult, saveKeys } from "./lib/
 
 export default function braveSearch(pi: ExtensionAPI) {
   pi.registerCommand("set-keys", {
-    description: "Set API keys for extensions (Brave, Context7)",
+    description: "Set API keys for extensions (Brave, Context7, Exa)",
     handler: async (_args, ctx) => {
       const keys = loadKeys();
       
@@ -17,6 +17,11 @@ export default function braveSearch(pi: ExtensionAPI) {
       const context7Key = await ctx.ui.input("Enter Context7 API Key (leave empty to keep current):", "");
       if (context7Key && context7Key.trim() !== "") {
         keys.context7 = context7Key.trim();
+      }
+
+      const exaKey = await ctx.ui.input("Enter Exa API Key (leave empty to keep current):", "");
+      if (exaKey && exaKey.trim() !== "") {
+        keys.exa = exaKey.trim();
       }
       
       saveKeys(keys);

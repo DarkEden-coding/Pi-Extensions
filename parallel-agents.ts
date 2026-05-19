@@ -31,6 +31,9 @@ interface ParallelAgentsConfig {
 }
 
 const CONFIG_PATH = join(getAgentDir(), "parallel-agents.json");
+const SEARCH_AGENT_PROFILE_NAME = "search-agent";
+const SEARCH_AGENT_TOOLS = ["brave_llm_search", "context7_search_library", "context7_get_context", "exa_web_search"];
+
 const DEBUG_LOG_PATH = join(getAgentDir(), "parallel-agents-debug.log");
 const DEFAULT_CONFIG: ParallelAgentsConfig = {
 	maxParallelAgents: 4,
@@ -118,6 +121,10 @@ function findProfile(config: ParallelAgentsConfig, name: string): ModelProfile |
 	return config.profiles.find((p) => p.name === name);
 }
 
+function resolveProfile(config: ParallelAgentsConfig, name: string): ModelProfile | undefined {
+	return findProfile(config, name);
+}
+
 function getSupportedThinkingLevelsLocal(model: Model<Api>): ThinkingLevel[] {
 	if (!model.reasoning) return ["off"];
 	const levels: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
@@ -129,12 +136,13 @@ function getSupportedThinkingLevelsLocal(model: Model<Api>): ThinkingLevel[] {
 	});
 }
 
-function taskTools(mode: TaskMode, allowedExtensionTools: string[]): string[] {
+function taskTools(mode: TaskMode, allowedExtensionTools: string[], profileName?: string): string[] {
 	const builtins =
 		mode === "editing"
 			? ["read", "grep", "find", "ls", "write", "edit", "bash"]
 			: ["read", "grep", "find", "ls", "brave_llm_search", "context7_search_library", "context7_get_context"];
-	return [...new Set([...builtins, ...allowedExtensionTools])];
+	const presetTools = profileName === SEARCH_AGENT_PROFILE_NAME ? SEARCH_AGENT_TOOLS : [];
+	return [...new Set([...builtins, ...presetTools, ...allowedExtensionTools])];
 }
 
 function isKimiProfile(profile: ModelProfile): boolean {
@@ -152,6 +160,9 @@ function debugLog(message: string, details?: unknown) {
 }
 
 function buildSubAgentPrompt(task: SubAgentTask, profile: ModelProfile): string {
+	const searchAgentRules = task.profile === SEARCH_AGENT_PROFILE_NAME
+		? "\n\nSearch-agent preset instructions:\n- You are a specific-purpose research sub-agent. Gather evidence first, then synthesize.\n- Prefer exa_web_search for semantic/neural AI-agent optimized web discovery.\n- Prefer brave_llm_search for factual/current context aggregation.\n- Use context7_search_library and context7_get_context for programming/library documentation.\n- Use filesystem tools to inspect the current repository when local project context is relevant.\n- Cite URLs and file paths. Explicitly list uncertainty and recommended follow-up searches."
+		: "";
 	const kimiEditRules = isKimiProfile(profile) && task.mode === "editing"
 		? `\n\nKimi/tool-use compatibility rules:\n- The edit tool requires this exact shape: {"path":"relative/or/absolute/path","edits":[{"oldText":"exact unique text copied from the current file","newText":"replacement text"}]}. Do not send oldText/newText at the top level.\n- Always read the target file immediately before an edit and copy oldText verbatim from that read result.\n- If an edit fails once because oldText is not unique or not found, re-read the file and either make a smaller exact edit or use bash with a short python script to rewrite the file deterministically.\n- For risky rewrites, first create an easily reverted backup outside the repo at /tmp/pi-parallel-agent-backups/<timestamp>-<basename>.bak, then report the backup path in your final answer.\n- Do not repeatedly retry the same failing edit arguments.`
 		: "";
@@ -159,7 +170,7 @@ function buildSubAgentPrompt(task: SubAgentTask, profile: ModelProfile): string 
 		task.mode === "editing"
 			? "You may edit files and run shell commands. Keep edits focused. If multiple agents are running, touch only files assigned in this prompt."
 			: "You are in read-only mode. Do not modify files or run shell commands. Only inspect and reason.";
-	return `You are a pi sub-agent running as part of a parallel multi-agent task.\n\nRules:\n- Complete only the task below.\n- ${modeRules}\n- Do not ask the user questions. If information is missing, state assumptions in the final answer.\n- Avoid interactive commands and tools.\n- Final answer should be concise and directly useful to the main agent.${kimiEditRules}\n\nTask:\n${task.prompt}`;
+	return `You are a pi sub-agent running as part of a parallel multi-agent task.\n\nRules:\n- Complete only the task below.\n- ${modeRules}\n- Do not ask the user questions. If information is missing, state assumptions in the final answer.\n- Avoid interactive commands and tools.\n- Final answer should be concise and directly useful to the main agent.${searchAgentRules}${kimiEditRules}\n\nTask:\n${task.prompt}`;
 }
 
 function getFinalAssistantText(session: any): string {
@@ -201,7 +212,7 @@ async function runSubAgent(
 		cwd: ctx.cwd,
 		agentDir: getAgentDir(),
 		settingsManager,
-		noExtensions: config.allowedExtensionTools.length === 0,
+		noExtensions: config.allowedExtensionTools.length === 0 && profile.name !== SEARCH_AGENT_PROFILE_NAME,
 		noSkills: true,
 		noPromptTemplates: true,
 		noThemes: true,
@@ -221,7 +232,7 @@ async function runSubAgent(
 		settingsManager,
 		resourceLoader: loader,
 		sessionManager: SessionManager.inMemory(ctx.cwd),
-		tools: taskTools(task.mode as TaskMode, config.allowedExtensionTools),
+		tools: taskTools(task.mode as TaskMode, config.allowedExtensionTools, profile.name),
 	});
 
 	debugLog("sub-agent-start", { name: task.name, profile, mode: task.mode });
@@ -303,12 +314,13 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 		name: "parallel_agents",
 		label: "Parallel Agents",
 		description:
-			"Run multiple isolated sub-agents concurrently. Each task must specify a configured profile, readonly/editing mode, and detailed prompt. Blocks until all sub-agents finish.",
+			"Run multiple isolated sub-agents concurrently. Each task must specify a configured profile, readonly/editing mode, and detailed prompt. A configured profile named search-agent receives special research instructions and search tools. Blocks until all sub-agents finish.",
 		promptSnippet: "Spawn isolated parallel sub-agents for research or focused edits.",
 		promptGuidelines: [
 			"Use parallel_agents when independent research or implementation tasks can run concurrently.",
 			"When using parallel_agents in editing mode, assign non-overlapping files/directories to each task.",
 			"parallel_agents requires every task to specify a valid configured profile name.",
+			"Create and use a configured profile named \"search-agent\" for broad research tasks needing Exa, Brave, Context7, and filesystem search."
 		],
 		parameters: PARALLEL_AGENTS_SCHEMA,
 		async execute(_toolCallId, params: ParallelAgentsInput, _signal, onUpdate, ctx) {
@@ -316,7 +328,7 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 			if (config.profiles.length === 0) {
 				return {
 					isError: true,
-					content: [{ type: "text", text: `No parallel-agent profiles configured. Run /parallel-agents to create profiles in ${CONFIG_PATH}.` }],
+					content: [{ type: "text", text: `No parallel-agent profiles configured. Run /parallel-agents to create profiles in ${CONFIG_PATH}. Create a profile named ${SEARCH_AGENT_PROFILE_NAME} to enable the built-in search preset.` }],
 					details: {},
 				};
 			}
@@ -336,7 +348,7 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 				};
 			}
 
-			const missing = params.tasks.map((t) => t.profile).filter((name) => !findProfile(config, name));
+			const missing = params.tasks.map((t) => t.profile).filter((name) => !resolveProfile(config, name));
 			if (missing.length > 0) {
 				return {
 					isError: true,
@@ -376,7 +388,7 @@ export default function parallelAgentsExtension(pi: ExtensionAPI) {
 			}, 120);
 			onUpdate?.({ content: [{ type: "text", text: `Starting ${params.tasks.length} parallel sub-agent(s)...` }], details: {} });
 			const settled = await Promise.allSettled(
-				params.tasks.map(async (task, index) => runSubAgent(task, findProfile(config, task.profile)!, config, ctx, stats[index], renderStats)),
+				params.tasks.map(async (task, index) => runSubAgent(task, resolveProfile(config, task.profile)!, config, ctx, stats[index], renderStats)),
 			);
 			clearInterval(spinnerTimer);
 			renderStats();

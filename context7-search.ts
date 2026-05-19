@@ -45,13 +45,14 @@ export default function (pi: ExtensionAPI) {
         // Step 1: Find the library
         const searchUrl = new URL(`${API_BASE}/libs/search`);
         searchUrl.searchParams.append("libraryName", params.libraryName);
+        searchUrl.searchParams.append("query", params.queries.join("\n"));
         
         const searchResponse = await fetch(searchUrl.toString(), { headers: headers(), signal });
         if (!searchResponse.ok) {
           throw new Error(`Library search failed: ${searchResponse.status} ${searchResponse.statusText}`);
         }
         const searchData = await searchResponse.json();
-        const library = searchData.libraries?.[0] || searchData[0]; // Handle different possible response structures
+        const library = Array.isArray(searchData.results) ? searchData.results[0] : searchData.results || searchData.libraries?.[0] || searchData[0]; // Context7 v2 returns results
 
         if (!library || !library.id) {
           return {
@@ -95,7 +96,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       libraryId: Type.String({ description: "The ID of the library from a previous search (e.g., '/vercel/next.js')" }),
       queries: Type.Array(Type.String({ description: "Specific questions or topics to get documentation for" })),
-      type: Type.Optional(Type.String({ description: "Format: json or markdown" })),
+      type: Type.Optional(Type.String({ description: "Format: json or txt" })),
     }),
     renderCall(args, theme, context) {
       const title = theme.fg("toolTitle", theme.bold("context7 context"));
@@ -122,7 +123,8 @@ export default function (pi: ExtensionAPI) {
             return { query, error: `API Error: ${response.status} ${response.statusText}${errorData ? ` - ${JSON.stringify(errorData)}` : ''}` };
           }
 
-          return { query, data: await response.json() };
+          const responseType = params.type || "json";
+          return { query, data: responseType === "txt" ? await response.text() : await response.json() };
         }));
 
         return {
