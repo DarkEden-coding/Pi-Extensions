@@ -154,13 +154,27 @@ function unblockedTasks(web?: TodoWeb): TodoTask[] {
 	return web.tasks.filter((t) => isUnblocked(t, web));
 }
 
+function taskLabel(task: TodoTask | undefined, id: string): string {
+	return task ? `${task.id}: ${task.title}` : id;
+}
+
+function relationText(task: TodoTask, web: TodoWeb): { deps: string; unlocks: string } {
+	const byId = new Map(web.tasks.map((t) => [t.id, t]));
+	const dependents = web.tasks.filter((candidate) => candidate.dependencies.includes(task.id));
+	return {
+		deps: task.dependencies.length ? task.dependencies.map((id) => `${taskLabel(byId.get(id), id)}${byId.get(id)?.status === "completed" ? " ✓" : ""}`).join(", ") : "none",
+		unlocks: dependents.length ? dependents.map((t) => `${t.id}: ${t.title}`).join(", ") : "none",
+	};
+}
+
 function formatWeb(web?: TodoWeb): string {
 	if (!web) return "No todo web.";
-	const byId = new Map(web.tasks.map((t) => [t.id, t]));
 	return [`# ${web.title}`, "", ...web.tasks.map((t) => {
-		const deps = t.dependencies.length ? ` deps: ${t.dependencies.map((d) => `${d}${byId.get(d)?.status === "completed" ? "✓" : ""}`).join(", ")}` : "";
+		const rel = relationText(t, web);
 		const blocked = t.status !== "completed" && !isUnblocked(t, web) ? " blocked" : "";
-		return `- [${t.status === "completed" ? "x" : " "}] ${t.id}: ${t.title} (${t.status}${blocked})${deps}\n  ${t.description}`;
+		const criteria = t.acceptanceCriteria.length ? `\n  acceptance: ${t.acceptanceCriteria.join("; ")}` : "";
+		const notes = t.notes.length ? `\n  notes: ${t.notes.join("; ")}` : "";
+		return `- [${t.status === "completed" ? "x" : " "}] ${t.id}: ${t.title} (${t.status}${blocked})\n  ${t.description}\n  deps: ${rel.deps}\n  unlocks: ${rel.unlocks}${criteria}${notes}`;
 	})].join("\n");
 }
 
@@ -263,8 +277,13 @@ function renderTodoWebLines(state: TodoState, theme: Theme, width: number, foote
 		lines.push("");
 		for (const t of web.tasks) {
 			const mark = t.status === "completed" ? th.fg("success", "✓") : isUnblocked(t, web) ? th.fg("warning", "○") : th.fg("dim", "⊘");
-			lines.push(`${mark} ${th.fg("accent", t.id)} ${th.fg(t.status === "completed" ? "dim" : "text", t.title)} ${th.fg("muted", `[${t.status}]`)}`);
-			if (t.dependencies.length) lines.push(th.fg("dim", `  deps: ${t.dependencies.join(", ")}`));
+			const rel = relationText(t, web);
+			lines.push(`${mark} ${th.fg("accent", `${t.id}:`)} ${th.fg(t.status === "completed" ? "dim" : "text", t.title)} ${th.fg("muted", `[${t.status}]`)}`);
+			lines.push(th.fg("dim", `  ${t.description}`));
+			lines.push(th.fg("dim", `  deps: ${rel.deps}`));
+			lines.push(th.fg("dim", `  unlocks: ${rel.unlocks}`));
+			if (t.acceptanceCriteria.length) lines.push(th.fg("dim", `  acceptance: ${t.acceptanceCriteria.join("; ")}`));
+			if (t.notes.length) lines.push(th.fg("dim", `  notes: ${t.notes.join("; ")}`));
 		}
 	}
 	if (footer.length) lines.push("", ...footer.map((l) => th.fg("dim", l)));
@@ -312,6 +331,7 @@ export default function todoExtension(pi: ExtensionAPI): void {
 			state.approved = true;
 			persist("approve");
 			ctx.ui.notify("Todo web approved. Use /todo → Run approved todo web.", "info");
+			await ctx.ui.custom<void>((_tui, theme, _kb, done) => new TodoWebComponent(state, theme, () => done()));
 		} else if (choice === "Refine") {
 			const refinement = await ctx.ui.input("How should the todo web be refined?", "Describe requested changes");
 			if (refinement?.trim()) {
@@ -348,7 +368,7 @@ export default function todoExtension(pi: ExtensionAPI): void {
 			}
 			if (params.action === "approve") {
 				state.approved = true;
-				return { content: [{ type: "text", text: "Todo web approved." }], details: { ...state, lastAction: "approve" } satisfies TodoState };
+				return { content: [{ type: "text", text: `Todo web approved.\n\n${formatWeb(state.web)}` }], details: { ...state, lastAction: "approve" } satisfies TodoState };
 			}
 			if (params.action === "set") {
 				const result = validateAndNormalizeWeb(params.web);
@@ -376,7 +396,7 @@ export default function todoExtension(pi: ExtensionAPI): void {
 						validationErrors.push(`Task ${completion.id} not found.`);
 						continue;
 					}
-					if (task.status !== "completed" && !beforeUnblocked.has(task.id)) validationErrors.push(`Task ${task.id} is still blocked by incomplete dependencies: ${task.dependencies.join(", ")}`);
+					if (task.status !== "completed" && !beforeUnblocked.has(task.id)) validationErrors.push(`Task ${task.id}: ${task.title} is still blocked by incomplete dependencies: ${relationText(task, state.web).deps}`);
 					tasksToComplete.push({ task, completion });
 				}
 				if (validationErrors.length) {
@@ -394,7 +414,7 @@ export default function todoExtension(pi: ExtensionAPI): void {
 				state = { ...state, lastAction: "complete", lastCompletedTaskId: completedIds[completedIds.length - 1], lastCompletedTaskIds: completedIds, newlyUnblocked, stillBlocked, error: undefined };
 				const remaining = nowUnblocked.filter((t) => t.status !== "completed");
 				const completedText = tasksToComplete.map(({ task }) => `- ${task.id}: ${task.title}`).join("\n");
-				const text = `Completed ${completedIds.length} task${completedIds.length === 1 ? "" : "s"}:\n${completedText}\n\nNewly unblocked:\n${newlyUnblocked.length ? newlyUnblocked.map((t) => `- ${t.id}: ${t.title}`).join("\n") : "- none"}\n\nStill blocked:\n${stillBlocked.length ? stillBlocked.map((t) => `- ${t.id}: ${t.title} (deps: ${t.dependencies.join(", ")})`).join("\n") : "- none"}\n\nFull todo web:\n${formatWeb(state.web)}\n\nNext: choose currently unblocked non-completed task(s) yourself. You may run independent unblocked tasks in parallel. Then call todo_web action=complete for every completed task. ${remaining.length ? `Currently unblocked: ${remaining.map((t) => `${t.id}: ${t.title}`).join("; ")}` : "No unblocked pending tasks remain."}`;
+				const text = `Completed ${completedIds.length} task${completedIds.length === 1 ? "" : "s"}:\n${completedText}\n\nNewly unblocked:\n${newlyUnblocked.length ? newlyUnblocked.map((t) => `- ${t.id}: ${t.title}`).join("\n") : "- none"}\n\nStill blocked:\n${stillBlocked.length ? stillBlocked.map((t) => `- ${t.id}: ${t.title} (deps: ${relationText(t, state.web!).deps})`).join("\n") : "- none"}\n\nFull todo web:\n${formatWeb(state.web)}\n\nNext: choose currently unblocked non-completed task(s) yourself. You may run independent unblocked tasks in parallel. Then call todo_web action=complete for every completed task. ${remaining.length ? `Currently unblocked: ${remaining.map((t) => `${t.id}: ${t.title}`).join("; ")}` : "No unblocked pending tasks remain."}`;
 				return { content: [{ type: "text", text }], details: { ...state } satisfies TodoState };
 			}
 			return { content: [{ type: "text", text: `Unknown action ${params.action}` }], details: { ...state, error: "unknown action" } satisfies TodoState };
@@ -409,7 +429,13 @@ export default function todoExtension(pi: ExtensionAPI): void {
 			const d = result.details as TodoState | undefined;
 			if (!d?.web) return new Text(theme.fg(d?.error ? "error" : "muted", d?.error ?? "No todo web"), 0, 0);
 			const done = d.web.tasks.filter((t) => t.status === "completed").length;
-			return new Text(`${theme.fg("accent", d.web.title)} ${theme.fg("muted", `${done}/${d.web.tasks.length} completed`)}${d.approved ? " " + theme.fg("success", "approved") : " " + theme.fg("warning", "unapproved")}`, 0, 0);
+			const unblocked = unblockedTasks(d.web);
+			const blocked = blockedTasks(d.web);
+			const status = d.approved ? theme.fg("success", "approved") : theme.fg("warning", "unapproved");
+			const lastCompleted = d.lastCompletedTaskIds?.length ? `\n${theme.fg("success", "completed: ")}${d.lastCompletedTaskIds.map((id) => taskLabel(d.web?.tasks.find((t) => t.id === id), id)).join(", ")}` : "";
+			const next = unblocked.length ? `\n${theme.fg("warning", "unblocked: ")}${unblocked.map((t) => `${t.id}: ${t.title}`).join(", ")}` : "";
+			const blockedLine = blocked.length ? `\n${theme.fg("muted", "blocked: ")}${blocked.map((t) => `${t.id}: ${t.title}`).join(", ")}` : "";
+			return new Text(`${theme.fg("accent", d.web.title)} ${theme.fg("muted", `${done}/${d.web.tasks.length} completed · ${unblocked.length} unblocked · ${blocked.length} blocked`)} ${status}${lastCompleted}${next}${blockedLine}`, 0, 0);
 		},
 	});
 
