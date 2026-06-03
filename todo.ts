@@ -4,7 +4,7 @@ import type { TUI } from "@earendil-works/pi-tui";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-type Status = "pending" | "in_progress" | "completed";
+type Status = "unapproved" | "pending" | "in_progress" | "completed";
 
 type TodoTask = {
 	id: string;
@@ -36,7 +36,7 @@ type TodoState = {
 	error?: string;
 };
 
-const VALID_STATUSES = new Set<Status>(["pending", "in_progress", "completed"]);
+const VALID_STATUSES = new Set<Status>(["unapproved", "pending", "in_progress", "completed"]);
 
 const CompletionParams = Type.Object({
 	id: Type.String({ description: "Task id being completed." }),
@@ -97,7 +97,7 @@ function validateAndNormalizeWeb(input: unknown): { web?: TodoWeb; errors: strin
 		const description = typeof t.description === "string" ? t.description.trim() : "";
 		if (!description) errors.push(`tasks[${i}].description must be a non-empty string`);
 
-		const status = t.status as Status;
+		const status = t.status === undefined ? "unapproved" : t.status as Status;
 		if (!VALID_STATUSES.has(status)) errors.push(`task ${id || i} has invalid status: ${String(t.status)}`);
 
 		tasks.push({
@@ -107,7 +107,7 @@ function validateAndNormalizeWeb(input: unknown): { web?: TodoWeb; errors: strin
 			acceptanceCriteria: normalizeStringArray(t.acceptanceCriteria, `task ${id || i}.acceptanceCriteria`, errors),
 			notes: normalizeStringArray(t.notes, `task ${id || i}.notes`, errors),
 			dependencies: normalizeStringArray(t.dependencies, `task ${id || i}.dependencies`, errors),
-			status: VALID_STATUSES.has(status) ? status : "pending",
+			status: VALID_STATUSES.has(status) ? status : "unapproved",
 		});
 	}
 
@@ -313,7 +313,7 @@ export default function todoExtension(pi: ExtensionAPI): void {
 	}
 
 	function systemCreatePrompt(userPrompt?: string, refinement?: string): string {
-		return `Create or revise a dependency-aware todo web for the user's large task. Call todo_web with action=set and a full JSON web. Do not mark it approved.\n\nSchema:\n{\n  "title": "string",\n  "tasks": [{\n    "id": "stable-short-id",\n    "title": "string",\n    "description": "string",\n    "acceptanceCriteria": ["string"],\n    "notes": ["string"],\n    "dependencies": ["task-id"],\n    "status": "pending"\n  }]\n}\n\nRules: every task must have a non-empty title/name and description; dependencies are task ids that must be completed before the task is unblocked; use only statuses pending/in_progress/completed; avoid cycles; make tasks small enough to complete one at a time.${userPrompt ? `\n\nUser prompt for this todo web:\n${userPrompt}` : ""}${refinement ? `\n\nUser refinement request:\n${refinement}` : ""}`;
+		return `Create or revise a dependency-aware todo web for the user's large task. Call todo_web with action=set and a full JSON web. Do not mark it approved. If you omit a task status, todo_web will treat it as unapproved.\n\nSchema:\n{\n  "title": "string",\n  "tasks": [{\n    "id": "stable-short-id",\n    "title": "string",\n    "description": "string",\n    "acceptanceCriteria": ["string"],\n    "notes": ["string"],\n    "dependencies": ["task-id"],\n    "status": "unapproved"\n  }]\n}\n\nRules: every task must have a non-empty title/name and description; dependencies are task ids that must be completed before the task is unblocked; use only statuses unapproved/pending/in_progress/completed; avoid cycles; make tasks small enough to complete one at a time.${userPrompt ? `\n\nUser prompt for this todo web:\n${userPrompt}` : ""}${refinement ? `\n\nUser refinement request:\n${refinement}` : ""}`;
 	}
 
 	function runPrompt(): string {
