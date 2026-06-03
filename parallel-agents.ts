@@ -2,11 +2,9 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname, join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
-	AuthStorage,
 	createAgentSession,
 	DefaultResourceLoader,
 	getAgentDir,
-	ModelRegistry,
 	SessionManager,
 	SettingsManager,
 	type ExtensionAPI,
@@ -199,10 +197,18 @@ async function runSubAgent(
 	stats: AgentRunStats,
 	onStatsChange: () => void,
 ): Promise<{ ok: boolean; name: string; output: string }> {
-	const authStorage = AuthStorage.create();
-	const modelRegistry = ModelRegistry.create(authStorage);
+	// Use the live context model registry instead of creating a fresh one.
+	// Provider/model registrations from extensions (for example cursor/composer-2.5)
+	// are applied to ctx.modelRegistry; a new registry only contains built-in/static
+	// models and would fail to find extension-provided profiles.
+	const modelRegistry = ctx.modelRegistry;
 	const model = modelRegistry.find(profile.provider, profile.model);
-	if (!model) throw new Error(`Profile ${profile.name}: model not found: ${profile.provider}/${profile.model}`);
+	if (!model) {
+		const available = modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`).sort();
+		throw new Error(
+			`Profile ${profile.name}: model not found: ${profile.provider}/${profile.model}. Available models in active registry: ${available.join(", ") || "(none)"}`,
+		);
+	}
 	if (!modelRegistry.hasConfiguredAuth(model)) {
 		throw new Error(`Profile ${profile.name}: no auth configured for provider ${profile.provider}`);
 	}
@@ -227,7 +233,6 @@ async function runSubAgent(
 		agentDir: getAgentDir(),
 		model,
 		thinkingLevel: profile.thinkingLevel,
-		authStorage,
 		modelRegistry,
 		settingsManager,
 		resourceLoader: loader,
