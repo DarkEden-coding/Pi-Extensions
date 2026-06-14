@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { matchesKey } from "@earendil-works/pi-tui";
 import { promisify } from "node:util";
 
@@ -119,26 +119,6 @@ async function readClipboardText(): Promise<string> {
 	throw new Error("Clipboard text paste fallback is currently implemented for Windows and macOS only.");
 }
 
-function windowsClipboardHasPlainTextOnly(): boolean {
-	try {
-		execFileSync(
-			"powershell.exe",
-			[
-				"-NoProfile",
-				"-STA",
-				"-ExecutionPolicy",
-				"Bypass",
-				"-Command",
-				"Add-Type -AssemblyName System.Windows.Forms; if ([System.Windows.Forms.Clipboard]::ContainsText() -and -not [System.Windows.Forms.Clipboard]::ContainsImage()) { exit 0 } else { exit 1 }",
-			],
-			{ stdio: "ignore", timeout: 1000 },
-		);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 function imageBlock(image: PendingImage): ImageBlock {
 	return {
 		type: "image",
@@ -169,6 +149,14 @@ function getCompleteBracketedPasteContent(data: string): string | undefined {
 
 function isDeleteKey(data: string): boolean {
 	return matchesKey(data, "backspace") || matchesKey(data, "delete");
+}
+
+function looksLikeUnbracketedMultiLinePaste(data: string): boolean {
+	return data.length > 1 && (data.includes("\r") || data.includes("\n"));
+}
+
+function normalizeTerminalPasteText(data: string): string {
+	return data.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
 function attachedImagesLines(): string[] | undefined {
@@ -243,14 +231,19 @@ export default function clipboardImagePaste(pi: ExtensionAPI) {
 			// Fully take over Ctrl+V at the raw terminal-input layer, avoiding Pi's built-in
 			// paste-image implementation and preserving text paste fallback ourselves.
 			if (isCtrlV(data) || isPasteCommandShortcut(data)) {
-				if (process.platform === "win32" && windowsClipboardHasPlainTextOnly()) {
-					return undefined;
-				}
 				void pasteFromClipboard(ctx);
 				return { consume: true };
 			}
 
 			if (isDeleteKey(data) && removeTrailingImagePlaceholder(ctx)) {
+				return { consume: true };
+			}
+
+			// Some terminal frontends send paste text as one raw, unbracketed chunk.
+			// Route multi-line chunks through Pi's editor paste path so they stay in a
+			// single message and still use the compact large-paste display.
+			if (looksLikeUnbracketedMultiLinePaste(data)) {
+				ctx.ui.pasteToEditor(normalizeTerminalPasteText(data));
 				return { consume: true };
 			}
 
@@ -263,14 +256,15 @@ export default function clipboardImagePaste(pi: ExtensionAPI) {
 			if (completePaste !== undefined) {
 				if (completePaste.length === 0) {
 					void pasteFromClipboard(ctx);
-					return { consume: true };
+				} else {
+					ctx.ui.pasteToEditor(completePaste);
 				}
-				return undefined;
+				return { consume: true };
 			}
 
 			if (data.includes("\x1b[200~")) {
 				bracketedPasteBuffer = data.slice(data.indexOf("\x1b[200~") + "\x1b[200~".length);
-				return undefined;
+				return { consume: true };
 			}
 			if (bracketedPasteBuffer !== undefined) {
 				bracketedPasteBuffer += data;
@@ -280,11 +274,11 @@ export default function clipboardImagePaste(pi: ExtensionAPI) {
 					bracketedPasteBuffer = undefined;
 					if (pasteContent.length === 0) {
 						void pasteFromClipboard(ctx);
-						// Do not consume the closing marker here: the editor already saw the
-						// opening marker in a previous chunk and needs the close to exit paste mode.
-						return undefined;
+					} else {
+						ctx.ui.pasteToEditor(pasteContent);
 					}
 				}
+				return { consume: true };
 			}
 			return undefined;
 		});
