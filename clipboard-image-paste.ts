@@ -138,13 +138,30 @@ function isPasteCommandShortcut(data: string): boolean {
 	return matchesKey(data, "alt+v");
 }
 
+const BRACKETED_PASTE_START_MARKERS = ["\x1b[200~", "[200~"] as const;
+const BRACKETED_PASTE_END_MARKERS = ["\x1b[201~", "[201~"] as const;
+
+type MarkerMatch = {
+	index: number;
+	marker: string;
+};
+
+function findFirstMarker(data: string, markers: readonly string[], fromIndex = 0): MarkerMatch | undefined {
+	let first: MarkerMatch | undefined;
+	for (const marker of markers) {
+		const index = data.indexOf(marker, fromIndex);
+		if (index !== -1 && (!first || index < first.index)) first = { index, marker };
+	}
+	return first;
+}
+
 function getCompleteBracketedPasteContent(data: string): string | undefined {
-	const start = data.indexOf("\x1b[200~");
-	if (start === -1) return undefined;
-	const contentStart = start + "\x1b[200~".length;
-	const end = data.indexOf("\x1b[201~", contentStart);
-	if (end === -1) return undefined;
-	return data.slice(contentStart, end);
+	const start = findFirstMarker(data, BRACKETED_PASTE_START_MARKERS);
+	if (!start) return undefined;
+	const contentStart = start.index + start.marker.length;
+	const end = findFirstMarker(data, BRACKETED_PASTE_END_MARKERS, contentStart);
+	if (!end) return undefined;
+	return data.slice(contentStart, end.index);
 }
 
 function isDeleteKey(data: string): boolean {
@@ -262,15 +279,26 @@ export default function clipboardImagePaste(pi: ExtensionAPI) {
 				return { consume: true };
 			}
 
-			if (data.includes("\x1b[200~")) {
-				bracketedPasteBuffer = data.slice(data.indexOf("\x1b[200~") + "\x1b[200~".length);
+			const pasteStart = findFirstMarker(data, BRACKETED_PASTE_START_MARKERS);
+			if (pasteStart) {
+				bracketedPasteBuffer = data.slice(pasteStart.index + pasteStart.marker.length);
+				const end = findFirstMarker(bracketedPasteBuffer, BRACKETED_PASTE_END_MARKERS);
+				if (end) {
+					const pasteContent = bracketedPasteBuffer.slice(0, end.index);
+					bracketedPasteBuffer = undefined;
+					if (pasteContent.length === 0) {
+						void pasteFromClipboard(ctx);
+					} else {
+						ctx.ui.pasteToEditor(pasteContent);
+					}
+				}
 				return { consume: true };
 			}
 			if (bracketedPasteBuffer !== undefined) {
 				bracketedPasteBuffer += data;
-				const end = bracketedPasteBuffer.indexOf("\x1b[201~");
-				if (end !== -1) {
-					const pasteContent = bracketedPasteBuffer.slice(0, end);
+				const end = findFirstMarker(bracketedPasteBuffer, BRACKETED_PASTE_END_MARKERS);
+				if (end) {
+					const pasteContent = bracketedPasteBuffer.slice(0, end.index);
 					bracketedPasteBuffer = undefined;
 					if (pasteContent.length === 0) {
 						void pasteFromClipboard(ctx);
